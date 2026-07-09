@@ -1,10 +1,11 @@
-const express = require("express");
-const session = require("express-session");
-const multer  = require("multer");
-const http    = require("http");
+"use strict";
+const express   = require("express");
+const session   = require("express-session");
+const multer    = require("multer");
+const http      = require("http");
 const WebSocket = require("ws");
-const fs      = require("fs");
-const path    = require("path");
+const fs        = require("fs");
+const path      = require("path");
 const { spawn, execSync } = require("child_process");
 const archiver  = require("archiver");
 const unzipper  = require("unzipper");
@@ -13,211 +14,284 @@ const app    = express();
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server });
 
-const CFG_FILE = path.join(__dirname, "panel.config.json");
-function loadCfg() { try { return JSON.parse(fs.readFileSync(CFG_FILE,"utf8")); } catch { return {}; } }
-function saveCfg(o) { fs.writeFileSync(CFG_FILE, JSON.stringify(o,null,2)); }
-let cfg = loadCfg();
-
-const PANEL_PASSWORD = process.env.PANEL_PASSWORD || cfg.password || "admin123";
-const BOT_DIR  = path.join(__dirname, "bot");
-const LOG_FILE = path.join(__dirname, "panel.log");
-const STATS_FILE = path.join(__dirname, "stats.json");
+// ── CONFIG ──
+const CFG  = path.join(__dirname, "panel.config.json");
+const BDIR = path.join(__dirname, "bot");
+const LFILE= path.join(__dirname, "panel.log");
+const SFILE= path.join(__dirname, "stats.json");
 const PORT = process.env.PORT || 3000;
 
-if (!fs.existsSync(BOT_DIR)) fs.mkdirSync(BOT_DIR, { recursive: true });
+function loadJ(f,def={}){try{return JSON.parse(fs.readFileSync(f,"utf8"));}catch{return def;}}
+function saveJ(f,d){try{fs.writeFileSync(f,JSON.stringify(d,null,2));}catch{}}
+let cfg   = loadJ(CFG);
+let stats = loadJ(SFILE,{starts:0,crashes:0,totalUptime:0,history:[],loginAttempts:{}});
 
-function loadStats() { try { return JSON.parse(fs.readFileSync(STATS_FILE,"utf8")); } catch { return { starts:0, crashes:0, totalUptime:0, history:[], loginAttempts:{} }; } }
-function saveStats(s) { try { fs.writeFileSync(STATS_FILE, JSON.stringify(s,null,2)); } catch {} }
-let stats = loadStats();
+const PASS = process.env.PANEL_PASSWORD || cfg.password || "admin123";
+if(!fs.existsSync(BDIR)) fs.mkdirSync(BDIR,{recursive:true});
 
-app.use(express.json({ limit:"500mb" }));
-app.use(express.urlencoded({ extended:true, limit:"500mb" }));
-app.use(session({ secret: process.env.SESSION_SECRET || "belal_2024", resave:false, saveUninitialized:false, cookie:{ maxAge:7*24*60*60*1000 } }));
+// ── MIDDLEWARE ──
+app.use(express.json({limit:"500mb"}));
+app.use(express.urlencoded({extended:true,limit:"500mb"}));
+app.use(session({secret:process.env.SESSION_SECRET||"belal_bot_2024",resave:false,saveUninitialized:false,cookie:{maxAge:7*24*60*60*1000}}));
+const upload = multer({storage:multer.diskStorage({destination:(r,f,cb)=>cb(null,"/tmp/"),filename:(r,f,cb)=>cb(null,Date.now()+"_"+f.originalname)}),limits:{fileSize:500*1024*1024}});
 
-const storage = multer.diskStorage({ destination:(req,file,cb)=>cb(null,"/tmp/"), filename:(req,file,cb)=>cb(null,Date.now()+"_"+file.originalname) });
-const upload = multer({ storage, limits:{ fileSize:500*1024*1024 } });
+const auth = (req,res,next) => req.session.ok ? next() : res.redirect("/login");
+const safe = (base,rel) => { const f=path.resolve(base,rel||""); if(!f.startsWith(path.resolve(base))) throw new Error("Access denied"); return f; };
 
-function auth(req,res,next) { if (req.session.loggedIn) return next(); res.redirect("/login"); }
-function safeJoin(base,rel) { const f=path.resolve(base,rel||""); if (!f.startsWith(path.resolve(base))) throw new Error("Access denied"); return f; }
+// ── BOT ──
+let botProc=null, botLogs=[], botStart=null, autoRestart=cfg.autoRestart||false, rsTimer=null;
 
-let botProcess=null, botLogs=[], botStartTime=null, autoRestart=cfg.autoRestart||false, restartTimer=null;
-const MAX_LOGS=2000;
+function bc(d){wss.clients.forEach(c=>{if(c.readyState===WebSocket.OPEN)c.send(JSON.stringify(d));});}
 
-function broadcast(data) { wss.clients.forEach(c=>{ if(c.readyState===WebSocket.OPEN) c.send(JSON.stringify(data)); }); }
-
-function addLog(text,type="info") {
-  const entry={ time:new Date().toLocaleTimeString("bn-BD"), text, type, ts:Date.now() };
-  botLogs.push(entry); if(botLogs.length>MAX_LOGS) botLogs.shift();
-  broadcast({ type:"log", data:entry });
-  try { fs.appendFileSync(LOG_FILE, `[${entry.time}] [${type}] ${text}\n`); } catch {}
+function log(text,type="info"){
+  const e={time:new Date().toLocaleTimeString("bn-BD"),text,type,ts:Date.now()};
+  botLogs.push(e); if(botLogs.length>2000) botLogs.shift();
+  bc({type:"log",data:e});
+  try{fs.appendFileSync(LFILE,`[${e.time}][${type}] ${text}\n`);}catch{}
 }
 
-function fmtSec(s) { const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sc=s%60; return h>0?h+"h "+m+"m":m>0?m+"m "+sc+"s":sc+"s"; }
+function fmtS(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sc=s%60;return h>0?h+"h "+m+"m":m>0?m+"m "+sc+"s":sc+"s";}
 
-function startBot(reason="manual") {
-  if (botProcess) return { ok:false, msg:"বট ইতিমধ্যে চলছে" };
-  const idx=["index.js","app.js","main.js","bot.js","start.js"].find(f=>fs.existsSync(path.join(BOT_DIR,f)));
-  if (!idx) return { ok:false, msg:"index.js পাওয়া যায়নি — বট আপলোড করুন" };
-  if (!fs.existsSync(path.join(BOT_DIR,"node_modules"))) {
-    try { addLog("📦 npm install চলছে...","warn"); execSync("npm install",{cwd:BOT_DIR,timeout:120000}); addLog("✅ npm install সম্পন্ন","success"); }
-    catch(e) { addLog("⚠️ npm install সমস্যা: "+e.message,"error"); }
+function startBot(by="manual"){
+  if(botProc) return {ok:false,msg:"বট ইতিমধ্যে চলছে"};
+  const idx=["index.js","app.js","main.js","bot.js","start.js"].find(f=>fs.existsSync(path.join(BDIR,f)));
+  if(!idx) return {ok:false,msg:"index.js পাওয়া যায়নি — বট আপলোড করুন"};
+  if(!fs.existsSync(path.join(BDIR,"node_modules"))){
+    try{log("📦 npm install চলছে...","warn");execSync("npm install",{cwd:BDIR,timeout:180000});log("✅ npm install সম্পন্ন","success");}
+    catch(e){log("⚠️ npm install সমস্যা: "+e.message,"error");}
   }
-  botProcess=spawn("node",[idx],{cwd:BOT_DIR,env:{...process.env,FORCE_COLOR:"1"}});
-  botStartTime=Date.now(); stats.starts++; saveStats(stats);
-  addLog(`🟢 বট চালু (${reason}) — ${idx}`,"success");
-  broadcast({type:"status",running:true});
-  botProcess.stdout.on("data",d=>addLog(d.toString().trim(),"info"));
-  botProcess.stderr.on("data",d=>addLog(d.toString().trim(),"error"));
-  botProcess.on("exit",(code,signal)=>{
-    const up=botStartTime?Math.floor((Date.now()-botStartTime)/1000):0;
-    stats.totalUptime+=up; stats.history.push({date:new Date().toISOString(),uptime:up,code});
-    if(stats.history.length>50) stats.history.shift();
+  botProc=spawn("node",[idx],{cwd:BDIR,env:{...process.env,FORCE_COLOR:"1"}});
+  botStart=Date.now(); stats.starts++; saveJ(SFILE,stats);
+  log(`🟢 বট চালু (${by}) — ${idx}`,"success"); bc({type:"status",running:true});
+  botProc.stdout.on("data",d=>log(d.toString().trim(),"info"));
+  botProc.stderr.on("data",d=>log(d.toString().trim(),"error"));
+  botProc.on("exit",(code,sig)=>{
+    const up=botStart?Math.floor((Date.now()-botStart)/1000):0;
+    stats.totalUptime+=up; stats.history.push({date:new Date().toISOString(),uptime:up,code:code||sig});
+    if(stats.history.length>100) stats.history.shift();
     if(code!==0&&code!==null) stats.crashes++;
-    saveStats(stats);
-    addLog(`🔴 বট বন্ধ (code:${code||signal}, uptime:${fmtSec(up)})`,"error");
-    botProcess=null; botStartTime=null; broadcast({type:"status",running:false});
-    if(autoRestart&&code!==0&&code!==null) { addLog("🔄 Auto-restart: ১০ সেকেন্ড পরে...","warn"); restartTimer=setTimeout(()=>startBot("auto-restart"),10000); }
+    saveJ(SFILE,stats);
+    log(`🔴 বট বন্ধ (code:${code||sig}, uptime:${fmtS(up)})`,"error");
+    botProc=null; botStart=null; bc({type:"status",running:false});
+    if(autoRestart&&code!==0&&code!==null){log("🔄 Auto-restart ১০ সেকেন্ড পরে...","warn");rsTimer=setTimeout(()=>startBot("auto-restart"),10000);}
   });
-  return { ok:true, msg:"বট চালু হয়েছে" };
+  return {ok:true,msg:"বট চালু হয়েছে"};
 }
 
-function stopBot() {
-  if(restartTimer){clearTimeout(restartTimer);restartTimer=null;}
-  if(!botProcess) return {ok:false,msg:"বট চলছে না"};
-  botProcess.kill("SIGTERM"); botProcess=null; botStartTime=null;
-  addLog("🔴 বট বন্ধ করা হয়েছে","warn"); broadcast({type:"status",running:false});
+function stopBot(){
+  if(rsTimer){clearTimeout(rsTimer);rsTimer=null;}
+  if(!botProc) return {ok:false,msg:"বট চলছে না"};
+  botProc.kill("SIGTERM"); botProc=null; botStart=null;
+  log("🔴 বট বন্ধ করা হয়েছে","warn"); bc({type:"status",running:false});
   return {ok:true,msg:"বট বন্ধ হয়েছে"};
 }
 
-// AUTH
-app.get("/login",(req,res)=>{ if(req.session.loggedIn) return res.redirect("/"); res.send(loginHTML()); });
+// ── AUTH ──
+app.get("/login",(req,res)=>{if(req.session.ok)return res.redirect("/");res.send(loginHTML());});
 app.post("/login",(req,res)=>{
-  if(req.body.password===PANEL_PASSWORD){ req.session.loggedIn=true; res.json({ok:true}); }
+  if(req.body.password===PASS){req.session.ok=true;res.json({ok:true});}
   else res.json({ok:false,msg:"❌ ভুল পাসওয়ার্ড"});
 });
-app.get("/logout",(req,res)=>{ req.session.destroy(); res.redirect("/login"); });
-app.get("/"  ,auth,(req,res)=>res.send(mainHTML()));
+app.get("/logout",(req,res)=>{req.session.destroy();res.redirect("/login");});
+app.get("/"   ,auth,(req,res)=>res.send(mainHTML()));
 
-// BOT API
+// ── BOT API ──
 app.post("/api/bot/start",   auth,(req,res)=>res.json(startBot()));
 app.post("/api/bot/stop",    auth,(req,res)=>res.json(stopBot()));
 app.post("/api/bot/restart", auth,(req,res)=>{stopBot();setTimeout(()=>res.json(startBot("restart")),2000);});
-app.get("/api/bot/status",   auth,(req,res)=>res.json({running:!!botProcess,uptime:botStartTime?Math.floor((Date.now()-botStartTime)/1000):0}));
+app.get("/api/bot/status",   auth,(req,res)=>res.json({running:!!botProc,uptime:botStart?Math.floor((Date.now()-botStart)/1000):0}));
 app.get("/api/bot/logs",     auth,(req,res)=>res.json({logs:botLogs}));
-app.post("/api/bot/clearlogs",auth,(req,res)=>{botLogs=[];broadcast({type:"clearLogs"});res.json({ok:true});});
+app.post("/api/bot/clearlogs",auth,(req,res)=>{botLogs=[];bc({type:"clearLogs"});res.json({ok:true});});
 app.post("/api/bot/install", auth,(req,res)=>{
-  if(!fs.existsSync(path.join(BOT_DIR,"package.json"))) return res.json({ok:false,msg:"package.json নেই"});
-  try { addLog("📦 npm install চলছে...","warn"); execSync("npm install",{cwd:BOT_DIR,timeout:120000}); addLog("✅ সম্পন্ন","success"); res.json({ok:true,msg:"npm install সম্পন্ন"}); }
-  catch(e){ addLog("❌ npm install ব্যর্থ: "+e.message,"error"); res.json({ok:false,msg:e.message}); }
+  if(!fs.existsSync(path.join(BDIR,"package.json"))) return res.json({ok:false,msg:"package.json নেই"});
+  try{log("📦 npm install চলছে...","warn");execSync("npm install",{cwd:BDIR,timeout:180000});log("✅ সম্পন্ন","success");res.json({ok:true,msg:"npm install সম্পন্ন"});}
+  catch(e){log("❌ npm install ব্যর্থ: "+e.message,"error");res.json({ok:false,msg:e.message});}
 });
-app.post("/api/bot/autorestart",auth,(req,res)=>{ autoRestart=!!req.body.enabled; cfg.autoRestart=autoRestart; saveCfg(cfg); res.json({ok:true,enabled:autoRestart}); });
-app.get("/api/bot/downloadlog",auth,(req,res)=>{ if(fs.existsSync(LOG_FILE)) res.download(LOG_FILE,"bot.log"); else res.status(404).send("No log"); });
-app.post("/api/bot/clearlogfile",auth,(req,res)=>{ try{fs.writeFileSync(LOG_FILE,"");res.json({ok:true});}catch(e){res.json({ok:false,msg:e.message});} });
+app.post("/api/bot/autorestart",auth,(req,res)=>{autoRestart=!!req.body.enabled;cfg.autoRestart=autoRestart;saveJ(CFG,cfg);res.json({ok:true,enabled:autoRestart});});
+app.get("/api/bot/downloadlog",auth,(req,res)=>{if(fs.existsSync(LFILE))res.download(LFILE,"bot.log");else res.status(404).send("No log");});
+app.post("/api/bot/clearlogfile",auth,(req,res)=>{try{fs.writeFileSync(LFILE,"");res.json({ok:true});}catch(e){res.json({ok:false,msg:e.message});}});
 app.get("/api/stats",auth,(req,res)=>{
-  res.json({...stats,currentUptime:botStartTime?Math.floor((Date.now()-botStartTime)/1000):0,autoRestart,
-    memMB:Math.round(process.memoryUsage().rss/1024/1024),serverUptime:Math.floor(process.uptime()),
-    node:process.version,botFiles:fs.existsSync(BOT_DIR)?countFiles(BOT_DIR):0});
+  function countF(d){let c=0;try{fs.readdirSync(d).forEach(f=>{const s=fs.statSync(path.join(d,f));c+=s.isDirectory()?countF(path.join(d,f)):1;});}catch{}return c;}
+  res.json({...stats,running:!!botProc,currentUptime:botStart?Math.floor((Date.now()-botStart)/1000):0,autoRestart,
+    memMB:Math.round(process.memoryUsage().rss/1024/1024),serverUptime:Math.floor(process.uptime()),node:process.version,botFiles:countF(BDIR)});
 });
-function countFiles(dir){let c=0;try{fs.readdirSync(dir).forEach(f=>{const s=fs.statSync(path.join(dir,f));c+=s.isDirectory()?countFiles(path.join(dir,f)):1;});}catch{}return c;}
 app.get("/api/backup",auth,(req,res)=>{
   res.setHeader("Content-Disposition",`attachment; filename="bot-backup-${Date.now()}.zip"`);
-  const arc=archiver("zip",{zlib:{level:9}});arc.pipe(res);arc.directory(BOT_DIR,false);arc.finalize();
+  const a=archiver("zip",{zlib:{level:9}});a.pipe(res);a.directory(BDIR,false);a.finalize();
 });
 
-// FILE API
+// ── FILES ──
 app.get("/api/files",auth,(req,res)=>{
-  try{const dir=safeJoin(BOT_DIR,req.query.path||"");if(!fs.existsSync(dir))return res.json({items:[],current:""});
-  const items=fs.readdirSync(dir).map(name=>{const f=path.join(dir,name),s=fs.statSync(f);return{name,isDir:s.isDirectory(),size:s.size,mtime:s.mtime};}).sort((a,b)=>(b.isDir-a.isDir)||a.name.localeCompare(b.name));
-  res.json({items,current:req.query.path||""});}catch(e){res.status(500).json({error:e.message});}
+  try{
+    const dir=safe(BDIR,req.query.path||"");
+    if(!fs.existsSync(dir))return res.json({items:[],current:req.query.path||""});
+    const items=fs.readdirSync(dir).map(name=>{
+      const f=path.join(dir,name),s=fs.statSync(f);
+      return{name,isDir:s.isDirectory(),size:s.size,mtime:s.mtime,ext:path.extname(name).toLowerCase()};
+    }).sort((a,b)=>(b.isDir-a.isDir)||a.name.localeCompare(b.name));
+    res.json({items,current:req.query.path||""});
+  }catch(e){res.status(500).json({error:e.message});}
 });
 app.get("/api/file/read",auth,(req,res)=>{
-  try{const f=safeJoin(BOT_DIR,req.query.path),s=fs.statSync(f);if(s.size>5*1024*1024)return res.json({error:"ফাইল অনেক বড়"});res.json({content:fs.readFileSync(f,"utf8")});}
+  try{const f=safe(BDIR,req.query.path),s=fs.statSync(f);if(s.size>5*1024*1024)return res.json({error:"ফাইল অনেক বড় (5MB+)"});res.json({content:fs.readFileSync(f,"utf8")});}
   catch(e){res.status(500).json({error:e.message});}
 });
 app.post("/api/file/save",auth,(req,res)=>{
-  try{const f=safeJoin(BOT_DIR,req.body.path);fs.mkdirSync(path.dirname(f),{recursive:true});fs.writeFileSync(f,req.body.content||"");res.json({ok:true});}
+  try{const f=safe(BDIR,req.body.path);fs.mkdirSync(path.dirname(f),{recursive:true});fs.writeFileSync(f,req.body.content||"");res.json({ok:true});}
   catch(e){res.status(500).json({error:e.message});}
 });
-app.post("/api/file/delete",auth,(req,res)=>{try{fs.rmSync(safeJoin(BOT_DIR,req.body.path),{recursive:true,force:true});res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
-app.post("/api/file/mkdir",auth,(req,res)=>{try{fs.mkdirSync(safeJoin(BOT_DIR,req.body.path),{recursive:true});res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
-app.post("/api/file/rename",auth,(req,res)=>{try{fs.renameSync(safeJoin(BOT_DIR,req.body.from),safeJoin(BOT_DIR,req.body.to));res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/file/delete",auth,(req,res)=>{try{fs.rmSync(safe(BDIR,req.body.path),{recursive:true,force:true});res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/file/mkdir",auth,(req,res)=>{try{fs.mkdirSync(safe(BDIR,req.body.path),{recursive:true});res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/file/rename",auth,(req,res)=>{
+  try{
+    const from=safe(BDIR,req.body.from),to=safe(BDIR,req.body.to);
+    // cross-device safe
+    const sf=fs.statSync(from);
+    if(sf.isDirectory()){
+      function cpR(s,d){fs.mkdirSync(d,{recursive:true});fs.readdirSync(s).forEach(n=>{const ss=path.join(s,n),dd=path.join(d,n);fs.statSync(ss).isDirectory()?cpR(ss,dd):fs.copyFileSync(ss,dd);});}
+      cpR(from,to); fs.rmSync(from,{recursive:true,force:true});
+    } else { fs.copyFileSync(from,to); fs.unlinkSync(from); }
+    res.json({ok:true});
+  }catch(e){res.status(500).json({error:e.message});}
+});
 app.post("/api/file/newfile",auth,(req,res)=>{
-  try{const f=safeJoin(BOT_DIR,req.body.path);if(fs.existsSync(f))return res.json({ok:false,msg:"ফাইল আছে"});fs.mkdirSync(path.dirname(f),{recursive:true});fs.writeFileSync(f,req.body.content||"");res.json({ok:true});}
+  try{const f=safe(BDIR,req.body.path);if(fs.existsSync(f))return res.json({ok:false,msg:"ফাইল আছে"});fs.mkdirSync(path.dirname(f),{recursive:true});fs.writeFileSync(f,req.body.content||"");res.json({ok:true});}
   catch(e){res.status(500).json({error:e.message});}
 });
 app.get("/api/file/download",auth,(req,res)=>{
-  try{const f=safeJoin(BOT_DIR,req.query.path);if(fs.statSync(f).isDirectory()){res.setHeader("Content-Disposition",`attachment; filename="${path.basename(f)}.zip"`);const a=archiver("zip",{zlib:{level:9}});a.pipe(res);a.directory(f,false);a.finalize();}else res.download(f);}
+  try{const f=safe(BDIR,req.query.path);if(fs.statSync(f).isDirectory()){res.setHeader("Content-Disposition",`attachment; filename="${path.basename(f)}.zip"`);const a=archiver("zip",{zlib:{level:9}});a.pipe(res);a.directory(f,false);a.finalize();}else res.download(f);}
   catch(e){res.status(500).send(e.message);}
 });
+
+// ── UPLOAD (cross-device safe) ──
 app.post("/api/file/upload",auth,upload.single("file"),async(req,res)=>{
-  try{const t=safeJoin(BOT_DIR,req.body.path||"");fs.mkdirSync(t,{recursive:true});
-  if(req.file.originalname.endsWith(".zip")){
-    const tmpX="/tmp/extract_"+Date.now();
-    fs.mkdirSync(tmpX,{recursive:true});
-    await new Promise((resolve,reject)=>fs.createReadStream(req.file.path).pipe(unzipper.Extract({path:tmpX})).on("close",resolve).on("error",reject));
-    fs.unlinkSync(req.file.path);
-    const mac=path.join(tmpX,"__MACOSX");if(fs.existsSync(mac))fs.rmSync(mac,{recursive:true,force:true});
-    const entries=fs.readdirSync(tmpX).filter(f=>!f.startsWith("."));
-    let srcDir=tmpX;
-    if(entries.length===1){const s=path.join(tmpX,entries[0]);if(fs.statSync(s).isDirectory())srcDir=s;}
-    fs.readdirSync(srcDir).forEach(name=>{const from=path.join(srcDir,name),to=path.join(t,name);if(fs.existsSync(to))fs.rmSync(to,{recursive:true,force:true});fs.renameSync(from,to);});
-    fs.rmSync(tmpX,{recursive:true,force:true});
-    addLog("📦 ZIP extract সম্পন্ন → "+(req.body.path||"/"),"success");res.json({ok:true,msg:"ZIP extract সম্পন্ন ✅"});
-  }else{fs.copyFileSync(req.file.path,path.join(t,req.file.originalname));fs.unlinkSync(req.file.path);res.json({ok:true,msg:"আপলোড সম্পন্ন ✅"});}
+  try{
+    const t=safe(BDIR,req.body.path||"");
+    fs.mkdirSync(t,{recursive:true});
+    if(req.file.originalname.endsWith(".zip")){
+      const tmpX=path.join("/tmp","xtr_"+Date.now());
+      fs.mkdirSync(tmpX,{recursive:true});
+      await new Promise((ok,fail)=>fs.createReadStream(req.file.path).pipe(unzipper.Extract({path:tmpX})).on("close",ok).on("error",fail));
+      try{fs.unlinkSync(req.file.path);}catch{}
+      // cleanup junk
+      ["__MACOSX",".DS_Store"].forEach(j=>{const jj=path.join(tmpX,j);if(fs.existsSync(jj))fs.rmSync(jj,{recursive:true,force:true});});
+      // auto-flatten single root folder
+      const entries=fs.readdirSync(tmpX).filter(f=>!f.startsWith("."));
+      let src=tmpX;
+      if(entries.length===1){const s=path.join(tmpX,entries[0]);if(fs.statSync(s).isDirectory())src=s;}
+      // cross-device safe recursive copy
+      function cpR(s,d){
+        fs.mkdirSync(d,{recursive:true});
+        fs.readdirSync(s).forEach(n=>{
+          const ss=path.join(s,n),dd=path.join(d,n);
+          if(fs.statSync(ss).isDirectory()) cpR(ss,dd);
+          else fs.copyFileSync(ss,dd);
+        });
+      }
+      cpR(src,t);
+      try{fs.rmSync(tmpX,{recursive:true,force:true});}catch{}
+      log("📦 ZIP extract সম্পন্ন → "+(req.body.path||"/"),"success");
+      res.json({ok:true,msg:"ZIP extract সম্পন্ন ✅ সব ফাইল সাজানো হয়েছে"});
+    } else {
+      const dst=path.join(t,req.file.originalname);
+      fs.copyFileSync(req.file.path,dst);
+      try{fs.unlinkSync(req.file.path);}catch{}
+      res.json({ok:true,msg:"ফাইল আপলোড সম্পন্ন ✅"});
+    }
   }catch(e){res.status(500).json({error:e.message});}
 });
+
 app.get("/api/file/search",auth,(req,res)=>{
   const q=(req.query.q||"").toLowerCase();if(!q)return res.json({results:[]});
-  const results=[];function walk(dir,rel){try{fs.readdirSync(dir).forEach(name=>{const f=path.join(dir,name),rp=rel?rel+"/"+name:name,s=fs.statSync(f);if(name.toLowerCase().includes(q))results.push({name,path:rp,isDir:s.isDirectory(),size:s.size});if(s.isDirectory()&&results.length<100)walk(f,rp);});}catch{}}
-  walk(BOT_DIR,"");res.json({results:results.slice(0,50)});
+  const results=[];
+  function walk(dir,rel){try{fs.readdirSync(dir).forEach(name=>{const f=path.join(dir,name),rp=rel?rel+"/"+name:name,s=fs.statSync(f);if(name.toLowerCase().includes(q))results.push({name,path:rp,isDir:s.isDirectory(),size:s.size});if(s.isDirectory()&&results.length<100)walk(f,rp);});}catch{}}
+  walk(BDIR,"");res.json({results:results.slice(0,50)});
 });
-app.get("/api/env",auth,(req,res)=>{const f=path.join(BOT_DIR,".env");res.json({content:fs.existsSync(f)?fs.readFileSync(f,"utf8"):""});});
-app.post("/api/env/save",auth,(req,res)=>{try{fs.writeFileSync(path.join(BOT_DIR,".env"),req.body.content||"");res.json({ok:true});}catch(e){res.json({ok:false,msg:e.message});} });
+
+// ── ENV ──
+app.get("/api/env",auth,(req,res)=>{const f=path.join(BDIR,".env");res.json({content:fs.existsSync(f)?fs.readFileSync(f,"utf8"):""});});
+app.post("/api/env/save",auth,(req,res)=>{try{fs.writeFileSync(path.join(BDIR,".env"),req.body.content||"");res.json({ok:true});}catch(e){res.json({ok:false,msg:e.message});}});
+
+// ── SETTINGS ──
 app.get("/api/settings",auth,(req,res)=>res.json(cfg));
-app.post("/api/settings/save",auth,(req,res)=>{Object.assign(cfg,req.body);saveCfg(cfg);res.json({ok:true});});
+app.post("/api/settings/save",auth,(req,res)=>{Object.assign(cfg,req.body);saveJ(CFG,cfg);if(req.body.autoRestart!==undefined)autoRestart=!!req.body.autoRestart;res.json({ok:true});});
 app.post("/api/settings/password",auth,(req,res)=>{
   const{current,newPass}=req.body;
-  if(current!==PANEL_PASSWORD&&current!==cfg.password)return res.json({ok:false,msg:"বর্তমান পাসওয়ার্ড ভুল"});
+  if(current!==PASS&&current!==cfg.password)return res.json({ok:false,msg:"বর্তমান পাসওয়ার্ড ভুল"});
   if(!newPass||newPass.length<4)return res.json({ok:false,msg:"কমপক্ষে ৪ অক্ষর"});
-  cfg.password=newPass;saveCfg(cfg);res.json({ok:true,msg:"পাসওয়ার্ড পরিবর্তন হয়েছে"});
+  cfg.password=newPass;saveJ(CFG,cfg);res.json({ok:true,msg:"পাসওয়ার্ড পরিবর্তন হয়েছে"});
 });
 
-wss.on("connection",ws=>{ws.send(JSON.stringify({type:"status",running:!!botProcess}));ws.send(JSON.stringify({type:"logs",data:botLogs}));});
+// ── COOKIE HELPER ──
+app.post("/api/cookie/save",auth,(req,res)=>{
+  try{
+    const cookie=req.body.cookie||"";
+    // appstate.json format চেক
+    let appstate;
+    try{appstate=JSON.parse(cookie);}catch{appstate=null;}
+    if(appstate && Array.isArray(appstate)){
+      fs.writeFileSync(path.join(BDIR,"appstate.json"),JSON.stringify(appstate,null,2));
+      res.json({ok:true,msg:"Appstate সেভ হয়েছে ✅"});
+    } else {
+      // plain cookie string → .env এ COOKIE= হিসেবে সেভ
+      const envFile=path.join(BDIR,".env");
+      let env=fs.existsSync(envFile)?fs.readFileSync(envFile,"utf8"):"";
+      if(env.includes("COOKIE=")) env=env.replace(/COOKIE=.*/,"COOKIE="+cookie);
+      else env+="\nCOOKIE="+cookie;
+      fs.writeFileSync(envFile,env.trim());
+      res.json({ok:true,msg:"Cookie .env এ সেভ হয়েছে ✅"});
+    }
+  }catch(e){res.json({ok:false,msg:e.message});}
+});
+
+// ── WS ──
+wss.on("connection",ws=>{ws.send(JSON.stringify({type:"status",running:!!botProc}));ws.send(JSON.stringify({type:"logs",data:botLogs}));});
+
+// ── SCHEDULE ──
+setInterval(()=>{
+  if(!cfg.scheduleRestart||!cfg.scheduleTime)return;
+  const[h,m]=cfg.scheduleTime.split(":").map(Number),now=new Date();
+  if(now.getHours()===h&&now.getMinutes()===m&&now.getSeconds()<10&&botProc){stopBot();setTimeout(()=>startBot("schedule"),3000);log("⏰ Scheduled restart","warn");}
+},10000);
+
 server.listen(PORT,()=>console.log("Panel: http://localhost:"+PORT));
 
-// ═══════════════ HTML ═══════════════
-
+// ════════════════════════════════════════
+// HTML
+// ════════════════════════════════════════
 function loginHTML(){return `<!DOCTYPE html><html lang="bn"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Bot Panel</title>
+<title>Bot Panel — Login</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#09090f;font-family:'Segoe UI',sans-serif}
-.bg{position:fixed;inset:0;overflow:hidden}
-.orb{position:absolute;border-radius:50%;filter:blur(80px);opacity:.2;animation:fl 8s ease-in-out infinite}
-.o1{width:400px;height:400px;background:#6c63ff;top:-100px;left:-100px}
-.o2{width:300px;height:300px;background:#ff6584;bottom:-80px;right:-80px;animation-delay:4s}
-@keyframes fl{0%,100%{transform:scale(1)}50%{transform:scale(1.15)}}
-.card{position:relative;z-index:1;background:rgba(255,255,255,.04);backdrop-filter:blur(30px);border:1px solid rgba(255,255,255,.08);border-radius:24px;padding:48px 36px;width:90%;max-width:380px;text-align:center}
-.logo{width:80px;height:80px;margin:0 auto 20px;background:linear-gradient(135deg,#6c63ff,#ff6584);border-radius:22px;display:flex;align-items:center;justify-content:center;font-size:36px;box-shadow:0 0 50px rgba(108,99,255,.4);animation:p 3s ease-in-out infinite}
-@keyframes p{0%,100%{box-shadow:0 0 30px rgba(108,99,255,.4)}50%{box-shadow:0 0 70px rgba(108,99,255,.8)}}
-h1{color:#fff;font-size:22px;font-weight:900;margin-bottom:4px}
-.sub{color:rgba(255,255,255,.35);font-size:13px;margin-bottom:32px}
-input{width:100%;padding:14px 16px;border-radius:12px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.06);color:#fff;font-size:15px;outline:none;margin-bottom:12px;transition:.3s}
-input:focus{border-color:#6c63ff;background:rgba(108,99,255,.1)}
-button{width:100%;padding:14px;border-radius:12px;border:none;background:linear-gradient(135deg,#6c63ff,#ff6584);color:#fff;font-size:15px;font-weight:800;cursor:pointer;transition:.3s}
-button:hover{opacity:.9;transform:translateY(-1px)}
-.err{background:rgba(255,94,94,.1);border:1px solid rgba(255,94,94,.2);color:#ff8080;padding:10px;border-radius:10px;font-size:13px;margin-bottom:12px;display:none}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#07070e;font-family:'Segoe UI',sans-serif;overflow:hidden}
+.bg{position:fixed;inset:0}
+.orb{position:absolute;border-radius:50%;filter:blur(90px);opacity:.18;animation:fl 8s ease-in-out infinite}
+.o1{width:500px;height:500px;background:#6c63ff;top:-150px;left:-150px}
+.o2{width:350px;height:350px;background:#ff6584;bottom:-100px;right:-100px;animation-delay:4s}
+.o3{width:200px;height:200px;background:#43e97b;top:40%;left:45%;animation-delay:2s}
+@keyframes fl{0%,100%{transform:scale(1) rotate(0deg)}50%{transform:scale(1.2) rotate(10deg)}}
+.card{position:relative;z-index:1;background:rgba(255,255,255,.04);backdrop-filter:blur(40px);border:1px solid rgba(255,255,255,.08);border-radius:28px;padding:52px 40px;width:90%;max-width:400px;text-align:center;box-shadow:0 30px 80px rgba(0,0,0,.6)}
+.logo{width:90px;height:90px;margin:0 auto 22px;background:linear-gradient(135deg,#6c63ff,#ff6584);border-radius:26px;display:flex;align-items:center;justify-content:center;font-size:40px;box-shadow:0 0 60px rgba(108,99,255,.5);animation:pulse 3s ease-in-out infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 40px rgba(108,99,255,.4)}50%{box-shadow:0 0 90px rgba(108,99,255,.9)}}
+h1{color:#fff;font-size:24px;font-weight:900;margin-bottom:4px}
+.sub{color:rgba(255,255,255,.3);font-size:13px;margin-bottom:36px}
+input{width:100%;padding:15px 18px;border-radius:14px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.06);color:#fff;font-size:15px;outline:none;margin-bottom:14px;transition:.3s;letter-spacing:.5px}
+input:focus{border-color:#6c63ff;background:rgba(108,99,255,.1);box-shadow:0 0 0 3px rgba(108,99,255,.15)}
+.btn{width:100%;padding:15px;border-radius:14px;border:none;background:linear-gradient(135deg,#6c63ff,#ff6584);color:#fff;font-size:16px;font-weight:800;cursor:pointer;transition:.3s}
+.btn:hover{transform:translateY(-2px);box-shadow:0 12px 40px rgba(108,99,255,.5)}
+.btn:active{transform:translateY(0)}
+.err{background:rgba(255,85,85,.1);border:1px solid rgba(255,85,85,.2);color:#ff8080;padding:11px;border-radius:10px;font-size:13px;margin-bottom:14px;display:none}
 .err.show{display:block}
 </style></head><body>
-<div class="bg"><div class="orb o1"></div><div class="orb o2"></div></div>
+<div class="bg"><div class="orb o1"></div><div class="orb o2"></div><div class="orb o3"></div></div>
 <div class="card">
   <div class="logo">🤖</div>
   <h1>Bot Panel</h1>
   <p class="sub">তোমার বট কন্ট্রোল সেন্টার</p>
   <div class="err" id="err"></div>
   <input type="password" id="pw" placeholder="🔐 পাসওয়ার্ড লিখুন" autofocus>
-  <button onclick="login()">প্রবেশ করুন →</button>
+  <button class="btn" onclick="login()">প্রবেশ করুন →</button>
 </div>
 <script>
 async function login(){
@@ -232,150 +306,196 @@ document.getElementById("pw").addEventListener("keydown",e=>e.key==="Enter"&&log
 function mainHTML(){
 const pname=cfg.panelName||"Bot Panel";
 return `<!DOCTYPE html><html lang="bn"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#07070e">
 <title>${pname}</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-:root{--bg:#09090f;--s1:#0f0f1a;--s2:#161625;--s3:#1c1c2e;--bd:#252538;--tx:#e0e0f0;--mu:#6b6b90;--ac:#6c63ff;--gr:#3fd68a;--rd:#ff5555;--yw:#ffd93d;--bl:#4fc3f7}
-body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',sans-serif;min-height:100vh;overflow-x:hidden}
-/* TOP NAV */
-.topnav{position:fixed;top:0;left:0;right:0;height:56px;background:var(--s1);border-bottom:1px solid var(--bd);display:flex;align-items:center;padding:0 16px;z-index:100;gap:12px}
-.tn-logo{width:34px;height:34px;background:linear-gradient(135deg,var(--ac),#ff6584);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
-.tn-title{font-size:15px;font-weight:800;color:#fff;flex:1}
-.tn-status{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--mu)}
-.tn-dot{width:8px;height:8px;border-radius:50%;background:var(--rd);flex-shrink:0}
-.tn-dot.on{background:var(--gr);box-shadow:0 0 6px var(--gr);animation:blink 2s infinite}
+:root{--bg:#07070e;--s1:#0d0d18;--s2:#141424;--s3:#1a1a2e;--bd:#232338;--tx:#dde0f0;--mu:#5a5a80;--ac:#6c63ff;--gr:#3ecf8e;--rd:#f05252;--yw:#f0b429;--bl:#38bdf8;--or:#fb923c}
+body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
+
+/* TOP BAR */
+.top{position:fixed;top:0;left:0;right:0;height:54px;background:rgba(13,13,24,.95);backdrop-filter:blur(20px);border-bottom:1px solid var(--bd);display:flex;align-items:center;padding:0 14px;z-index:200;gap:10px}
+.top-logo{width:34px;height:34px;background:linear-gradient(135deg,var(--ac),#ff6584);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;box-shadow:0 0 20px rgba(108,99,255,.4)}
+.top-name{font-size:15px;font-weight:800;color:#fff;flex:1}
+.top-pill{display:flex;align-items:center;gap:6px;background:var(--s2);border:1px solid var(--bd);border-radius:99px;padding:5px 12px;font-size:12px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--rd);flex-shrink:0;transition:.3s}
+.dot.on{background:var(--gr);box-shadow:0 0 8px var(--gr);animation:blink 2s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
-.tn-logout{padding:7px 12px;border-radius:8px;border:1px solid rgba(255,85,85,.3);background:transparent;color:var(--rd);font-size:12px;cursor:pointer}
-/* BOTTOM TAB BAR */
-.tabbar{position:fixed;bottom:0;left:0;right:0;height:64px;background:var(--s1);border-top:1px solid var(--bd);display:flex;align-items:center;z-index:100;padding:0 4px;padding-bottom:env(safe-area-inset-bottom)}
-.tab{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;cursor:pointer;padding:8px 4px;border-radius:10px;transition:.15s;color:var(--mu);border:none;background:transparent}
+.top-out{padding:7px 12px;border-radius:8px;border:1px solid rgba(240,82,82,.3);background:transparent;color:var(--rd);font-size:12px;cursor:pointer;transition:.2s}
+.top-out:hover{background:rgba(240,82,82,.1)}
+
+/* BOTTOM TAB */
+.tabs{position:fixed;bottom:0;left:0;right:0;background:rgba(13,13,24,.97);backdrop-filter:blur(20px);border-top:1px solid var(--bd);display:grid;grid-template-columns:repeat(5,1fr);height:60px;z-index:200;padding-bottom:env(safe-area-inset-bottom)}
+.tab{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;cursor:pointer;border:none;background:transparent;color:var(--mu);transition:.2s;position:relative}
 .tab.active{color:var(--ac)}
-.tab .ti{font-size:20px}
-.tab .tl{font-size:10px;font-weight:600}
-/* MAIN CONTENT */
-.main{padding:72px 14px 80px;min-height:100vh}
+.tab .ti{font-size:22px;line-height:1}
+.tab .tl{font-size:9px;font-weight:700;letter-spacing:.3px}
+.tab::after{content:"";position:absolute;top:0;left:50%;transform:translateX(-50%);width:0;height:2px;background:var(--ac);border-radius:0 0 3px 3px;transition:.2s}
+.tab.active::after{width:40px}
+
 /* PAGES */
+.main{padding:66px 12px 72px;min-height:100vh}
 .page{display:none}.page.active{display:block}
-/* CARDS */
-.card-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}
-.card{background:var(--s2);border:1px solid var(--bd);border-radius:14px;padding:14px}
-.ci{font-size:26px;margin-bottom:6px}
-.cv{font-size:20px;font-weight:800;color:#fff}
-.cl{font-size:11px;color:var(--mu);margin-top:2px}
+.pg-title{font-size:16px;font-weight:800;color:#fff;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+
+/* STAT CARDS */
+.sg{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+.sc{background:linear-gradient(135deg,var(--s2),var(--s3));border:1px solid var(--bd);border-radius:16px;padding:14px;transition:.2s}
+.sc:hover{border-color:var(--ac);transform:translateY(-1px)}
+.sc-i{font-size:26px;margin-bottom:6px}
+.sc-v{font-size:22px;font-weight:900;color:#fff}
+.sc-l{font-size:11px;color:var(--mu);margin-top:2px}
+
 /* BOT CONTROL */
-.bot-card{background:var(--s2);border:1px solid var(--bd);border-radius:16px;padding:16px;margin-bottom:14px}
-.status-row{display:flex;align-items:center;gap:10px;margin-bottom:16px}
-.sdot{width:12px;height:12px;border-radius:50%;background:var(--rd);flex-shrink:0}
-.sdot.on{background:var(--gr);box-shadow:0 0 10px var(--gr);animation:blink 2s infinite}
-.stxt{font-size:15px;font-weight:700}
-.sup{font-size:11px;color:var(--mu)}
-.btn-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.btn{padding:12px;border-radius:12px;border:none;font-size:13px;font-weight:700;cursor:pointer;transition:.2s;display:flex;align-items:center;justify-content:center;gap:6px;width:100%}
-.btn:active{transform:scale(.97)}
-.btn-start{background:linear-gradient(135deg,#3fd68a,#38f9d7);color:#000}
-.btn-stop{background:linear-gradient(135deg,#ff5555,#ff9a9e);color:#fff}
-.btn-restart{background:linear-gradient(135deg,#ffd93d,#ff9a3c);color:#000}
-.btn-install{background:linear-gradient(135deg,#4fc3f7,#6c63ff);color:#fff}
-.btn-backup{background:linear-gradient(135deg,#a18cd1,#fbc2eb);color:#000}
-.btn-outline{background:transparent;border:1px solid var(--bd);color:var(--tx)}
+.bc{background:var(--s2);border:1px solid var(--bd);border-radius:18px;padding:16px;margin-bottom:12px}
+.bst{display:flex;align-items:center;gap:10px;margin-bottom:14px;padding:12px;background:var(--s3);border-radius:12px}
+.bst-info{flex:1}
+.bst-txt{font-size:14px;font-weight:700}
+.bst-up{font-size:11px;color:var(--mu);margin-top:2px}
+.bg2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.bg3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px}
+.btn{width:100%;padding:12px 8px;border-radius:12px;border:none;font-size:12px;font-weight:700;cursor:pointer;transition:.2s;display:flex;align-items:center;justify-content:center;gap:5px}
+.btn:active{transform:scale(.96)}
+.b-start{background:linear-gradient(135deg,#3ecf8e,#22d3ee);color:#000}
+.b-stop{background:linear-gradient(135deg,#f05252,#fb7185);color:#fff}
+.b-restart{background:linear-gradient(135deg,#f0b429,#fb923c);color:#000}
+.b-npm{background:linear-gradient(135deg,#38bdf8,#6c63ff);color:#fff}
+.b-backup{background:linear-gradient(135deg,#a78bfa,#ec4899);color:#fff}
+.b-ghost{background:transparent;border:1px solid var(--bd);color:var(--tx)}
+.b-danger{background:transparent;border:1px solid rgba(240,82,82,.3);color:var(--rd)}
+
 /* TOGGLE */
-.tog-row{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-top:1px solid var(--bd);margin-top:4px}
-.tog{position:relative;width:42px;height:24px;flex-shrink:0}
+.tog-row{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-top:1px solid var(--bd);margin-top:8px}
+.tog{position:relative;width:44px;height:24px;flex-shrink:0}
 .tog input{display:none}
-.togbg{position:absolute;inset:0;background:var(--bd);border-radius:99px;cursor:pointer;transition:.3s}
-.tog input:checked+.togbg{background:var(--gr)}
-.togdot{position:absolute;top:3px;left:3px;width:18px;height:18px;background:#fff;border-radius:50%;transition:.3s;pointer-events:none}
-.tog input:checked~.togdot{transform:translateX(18px)}
+.tog-bg{position:absolute;inset:0;background:var(--bd);border-radius:99px;cursor:pointer;transition:.3s}
+.tog input:checked+.tog-bg{background:var(--gr)}
+.tog-dot{position:absolute;top:3px;left:3px;width:18px;height:18px;background:#fff;border-radius:50%;transition:.3s;pointer-events:none;box-shadow:0 1px 4px rgba(0,0,0,.3)}
+.tog input:checked~.tog-dot{transform:translateX(20px)}
+
+/* COOKIE SECTION */
+.cookie-box{background:var(--s2);border:1px solid var(--bd);border-radius:18px;padding:16px;margin-bottom:12px}
+.cookie-title{font-size:14px;font-weight:700;color:#fff;margin-bottom:4px;display:flex;align-items:center;gap:6px}
+.cookie-sub{font-size:12px;color:var(--mu);margin-bottom:12px}
+textarea.cookie-input{width:100%;height:90px;background:var(--s3);border:1px solid var(--bd);border-radius:12px;padding:12px;color:var(--tx);font-family:'Courier New',monospace;font-size:11px;resize:none;outline:none;transition:.2s;line-height:1.5}
+textarea.cookie-input:focus{border-color:var(--ac)}
+
+/* HISTORY */
+.hist{display:flex;flex-direction:column;gap:6px;max-height:200px;overflow-y:auto}
+.hi{display:flex;align-items:center;gap:8px;padding:10px 12px;background:var(--s2);border-radius:10px;border:1px solid var(--bd);font-size:11px}
+.hi-date{color:var(--mu);flex:1}
+.hi-up{color:var(--gr);font-weight:700}
+.hi-code{color:var(--yw)}
+
 /* LOGS */
-.log-topbar{display:flex;gap:8px;margin-bottom:10px;overflow-x:auto;padding-bottom:4px}
-.lf{padding:6px 12px;border-radius:8px;border:1px solid var(--bd);background:transparent;color:var(--mu);font-size:12px;cursor:pointer;white-space:nowrap}
-.lf.active{background:var(--ac);color:#fff;border-color:var(--ac)}
-.log-box{background:#03030a;border:1px solid var(--bd);border-radius:14px;padding:12px;height:calc(100vh - 220px);overflow-y:auto;font-family:'Courier New',monospace;font-size:12px}
-.log-box::-webkit-scrollbar{width:3px}
-.log-box::-webkit-scrollbar-thumb{background:var(--bd);border-radius:2px}
-.le{display:flex;gap:6px;padding:2px 0;line-height:1.6}
-.lt{color:var(--mu);white-space:nowrap;font-size:11px;flex-shrink:0}
+.log-bar{display:flex;gap:6px;margin-bottom:10px;overflow-x:auto;padding-bottom:2px}
+.log-bar::-webkit-scrollbar{display:none}
+.lf{padding:6px 12px;border-radius:8px;border:1px solid var(--bd);background:transparent;color:var(--mu);font-size:12px;cursor:pointer;white-space:nowrap;transition:.15s}
+.lf.on{background:var(--ac);color:#fff;border-color:var(--ac)}
+.lf:hover:not(.on){color:var(--tx)}
+.lbox{background:#020209;border:1px solid var(--bd);border-radius:14px;padding:12px;height:calc(100vh - 200px);overflow-y:auto;font-family:'Courier New',monospace;font-size:11.5px}
+.lbox::-webkit-scrollbar{width:3px}
+.lbox::-webkit-scrollbar-thumb{background:var(--bd);border-radius:2px}
+.le{display:flex;gap:6px;padding:2px 0;line-height:1.65}
+.lt{color:var(--mu);white-space:nowrap;font-size:10px;flex-shrink:0}
 .lx{word-break:break-all}
-.log-info .lx{color:#b8c0d0}
-.log-success .lx{color:var(--gr)}
-.log-error .lx{color:var(--rd)}
-.log-warn .lx{color:var(--yw)}
+.li .lx{color:#9ca3af}
+.ls .lx{color:var(--gr)}
+.lr .lx{color:var(--rd)}
+.lw .lx{color:var(--yw)}
+
 /* FILE MANAGER */
-.pathbar{background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:8px 12px;font-size:12px;color:var(--mu);margin-bottom:10px;overflow-x:auto;white-space:nowrap}
-.pp{color:var(--ac);cursor:pointer}.pp:hover{text-decoration:underline}
-.fm-actions{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
+.pathbar{background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:8px 12px;font-size:12px;color:var(--mu);margin-bottom:10px;overflow-x:auto;white-space:nowrap;display:flex;align-items:center;gap:4px}
+.pathbar::-webkit-scrollbar{display:none}
+.pp{color:var(--ac);cursor:pointer;font-weight:600}
+.pp:hover{text-decoration:underline}
+.fm-acts{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
+.tbtn{padding:8px 13px;border-radius:9px;border:1px solid var(--bd);background:var(--s2);color:var(--tx);font-size:12px;cursor:pointer;white-space:nowrap;transition:.15s;display:inline-flex;align-items:center;gap:4px}
+.tbtn:hover{background:var(--s3)}
+.tbtn.p{background:var(--ac);border-color:var(--ac);color:#fff}
+.tbtn.d{border-color:rgba(240,82,82,.3);color:var(--rd)}
+.tbtn.d:hover{background:rgba(240,82,82,.08)}
+.sinput{width:100%;padding:10px 14px;border-radius:10px;border:1px solid var(--bd);background:var(--s2);color:var(--tx);font-size:13px;outline:none;margin-bottom:10px;transition:.2s}
+.sinput:focus{border-color:var(--ac)}
 .flist{background:var(--s2);border:1px solid var(--bd);border-radius:14px;overflow:hidden}
-.frow{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.03);cursor:pointer;transition:.1s}
+.frow{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid rgba(255,255,255,.03);cursor:pointer;transition:.12s}
 .frow:last-child{border-bottom:none}
-.frow:active{background:rgba(108,99,255,.08)}
-.frow-info{flex:1;overflow:hidden}
-.frow-name{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.frow-meta{font-size:11px;color:var(--mu);margin-top:2px}
-.frow-acts{display:flex;gap:4px;flex-shrink:0}
-.fa{padding:6px 8px;border-radius:7px;border:none;background:var(--s3);color:var(--mu);font-size:12px;cursor:pointer}
-.fa.del{color:var(--rd)}
-.ficon{font-size:22px;flex-shrink:0}
-.empty{padding:40px;text-align:center;color:var(--mu)}
-.empty .eb{font-size:40px;margin-bottom:8px}
+.frow:active{background:rgba(108,99,255,.07)}
+.fi{font-size:20px;flex-shrink:0;width:26px;text-align:center}
+.fn{flex:1;overflow:hidden}
+.fn-name{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.fn-meta{font-size:10px;color:var(--mu);margin-top:2px}
+.fa{display:flex;gap:3px;flex-shrink:0}
+.fab{padding:6px 8px;border-radius:7px;border:none;background:var(--s3);color:var(--mu);font-size:12px;cursor:pointer;transition:.12s}
+.fab:hover{background:var(--bd);color:var(--tx)}
+.fab.del:hover{background:rgba(240,82,82,.15);color:var(--rd)}
+.empty-fm{padding:48px;text-align:center;color:var(--mu)}
+.empty-fm .ei{font-size:44px;margin-bottom:10px}
+
 /* EDITOR */
-.ed-header{background:var(--s2);border:1px solid var(--bd);border-radius:12px 12px 0 0;padding:10px 14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.ed-fname{flex:1;font-size:12px;color:var(--ac);font-weight:700;overflow:hidden;text-overflow:ellipsis}
-#codeEd{width:100%;height:calc(100vh - 240px);background:#020208;border:1px solid var(--bd);border-top:none;border-radius:0 0 12px 12px;padding:14px;color:#e6edf3;font-family:'Courier New',monospace;font-size:13px;line-height:1.8;resize:none;outline:none;tab-size:2}
+.ed-top{background:var(--s2);border:1px solid var(--bd);border-radius:14px 14px 0 0;padding:10px 14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ed-fn{flex:1;font-size:12px;color:var(--ac);font-weight:700;overflow:hidden;text-overflow:ellipsis}
+.ed-lang{font-size:10px;color:var(--mu);background:var(--s3);padding:3px 8px;border-radius:6px}
+#ced{width:100%;height:calc(100vh - 230px);background:#010108;border:1px solid var(--bd);border-top:none;border-radius:0 0 14px 14px;padding:14px;color:#e6edf3;font-family:'Courier New',monospace;font-size:13px;line-height:1.8;resize:none;outline:none;tab-size:2}
+
 /* UPLOAD */
-.upzone{border:2px dashed var(--bd);border-radius:16px;padding:44px 20px;text-align:center;cursor:pointer;background:var(--s2);transition:.2s;margin-bottom:14px}
-.upzone:active,.upzone.drag{border-color:var(--ac);background:rgba(108,99,255,.05)}
-.upzone .ui{font-size:48px;margin-bottom:12px}
-.prog-wrap{background:var(--s2);border:1px solid var(--bd);border-radius:14px;padding:16px;display:none}
+.upzone{border:2px dashed var(--bd);border-radius:18px;padding:48px 20px;text-align:center;cursor:pointer;background:var(--s2);transition:.3s;margin-bottom:14px}
+.upzone:active,.upzone.drag{border-color:var(--ac);background:rgba(108,99,255,.06)}
+.uz-i{font-size:54px;margin-bottom:14px;animation:bounce 2s ease-in-out infinite}
+@keyframes bounce{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+.prog-wrap{background:var(--s2);border:1px solid var(--bd);border-radius:14px;padding:18px;display:none}
 .prog-top{display:flex;justify-content:space-between;font-size:12px;margin-bottom:8px}
 .prog-bg{background:var(--bd);border-radius:99px;height:8px;overflow:hidden}
 .prog{height:100%;background:linear-gradient(90deg,var(--ac),var(--gr));border-radius:99px;transition:width .2s;width:0}
-/* SEARCH */
-.sinput{width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--bd);background:var(--s2);color:var(--tx);font-size:14px;outline:none;margin-bottom:12px;transition:.2s}
-.sinput:focus{border-color:var(--ac)}
-.srow{padding:12px 14px;background:var(--s2);border:1px solid var(--bd);border-radius:10px;margin-bottom:6px;cursor:pointer}
-.srow:active{background:var(--s3)}
-.srow-path{font-size:11px;color:var(--ac);margin-bottom:3px}
-.srow-text{font-size:12px;color:var(--mu)}
+
 /* ENV */
-#envEd{width:100%;height:300px;background:#020208;border:1px solid var(--bd);border-radius:12px;padding:14px;color:#e6edf3;font-family:'Courier New',monospace;font-size:13px;line-height:1.8;resize:vertical;outline:none;margin-bottom:10px}
+#envEd{width:100%;height:260px;background:#010108;border:1px solid var(--bd);border-radius:12px;padding:14px;color:#e6edf3;font-family:'Courier New',monospace;font-size:13px;line-height:1.8;resize:vertical;outline:none;margin-bottom:10px;transition:.2s}
+#envEd:focus{border-color:var(--ac)}
+
 /* SETTINGS */
-.sc{background:var(--s2);border:1px solid var(--bd);border-radius:14px;padding:16px;margin-bottom:12px}
-.sc-title{font-size:13px;font-weight:700;color:#fff;margin-bottom:14px}
-.srow2{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.04)}
-.srow2:last-child{border-bottom:none;padding-bottom:0}
-.sl{font-size:13px}.sl2{font-size:11px;color:var(--mu);margin-top:2px}
-.sinp{padding:8px 10px;border-radius:8px;border:1px solid var(--bd);background:var(--s1);color:var(--tx);font-size:13px;outline:none;max-width:180px}
+.set-card{background:var(--s2);border:1px solid var(--bd);border-radius:16px;padding:16px;margin-bottom:12px}
+.set-title{font-size:13px;font-weight:700;color:#fff;margin-bottom:14px;display:flex;align-items:center;gap:6px}
+.set-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.04);gap:10px}
+.set-row:last-child{border-bottom:none;padding-bottom:0}
+.sr-l{font-size:13px;flex:1}
+.sr-s{font-size:11px;color:var(--mu);margin-top:2px}
+.sinp{padding:8px 10px;border-radius:8px;border:1px solid var(--bd);background:var(--s1);color:var(--tx);font-size:12px;outline:none;max-width:160px;transition:.2s}
 .sinp:focus{border-color:var(--ac)}
+
 /* MODAL */
-.mbg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:500;align-items:flex-end;justify-content:center;backdrop-filter:blur(4px)}
+.mbg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:500;align-items:flex-end;justify-content:center;backdrop-filter:blur(6px)}
 .mbg.open{display:flex}
-.modal{background:var(--s2);border:1px solid var(--bd);border-radius:20px 20px 0 0;padding:24px;width:100%;max-width:500px;animation:mIn .25s ease}
+.modal{background:var(--s2);border:1px solid var(--bd);border-radius:22px 22px 0 0;padding:24px;width:100%;max-width:520px;animation:mIn .25s ease;padding-bottom:max(24px,env(safe-area-inset-bottom))}
 @keyframes mIn{from{transform:translateY(100%)}to{transform:translateY(0)}}
-.modal h3{font-size:15px;font-weight:800;margin-bottom:16px;color:#fff}
-.modal input{width:100%;padding:12px 14px;border-radius:10px;border:1px solid var(--bd);background:var(--s1);color:var(--tx);font-size:14px;outline:none;margin-bottom:12px}
+.modal h3{font-size:15px;font-weight:800;margin-bottom:16px;color:#fff;text-align:center}
+.modal input{width:100%;padding:12px 14px;border-radius:10px;border:1px solid var(--bd);background:var(--s1);color:var(--tx);font-size:14px;outline:none;margin-bottom:12px;transition:.2s}
 .modal input:focus{border-color:var(--ac)}
 .modal-btns{display:flex;gap:8px}
+
 /* TOAST */
-.tw{position:fixed;top:66px;right:12px;display:flex;flex-direction:column;gap:6px;z-index:999;pointer-events:none;max-width:280px}
-.toast{background:var(--s3);border:1px solid var(--bd);border-radius:12px;padding:10px 14px;font-size:13px;animation:tIn .3s ease;box-shadow:0 6px 20px rgba(0,0,0,.4);pointer-events:auto}
+.tw{position:fixed;top:62px;right:12px;display:flex;flex-direction:column;gap:6px;z-index:999;pointer-events:none;max-width:260px}
+.toast{background:var(--s3);border-radius:12px;padding:10px 14px;font-size:12px;animation:tIn .3s ease;box-shadow:0 8px 24px rgba(0,0,0,.5);pointer-events:auto;border-left:3px solid var(--bd)}
 @keyframes tIn{from{transform:translateX(120%);opacity:0}to{transform:translateX(0);opacity:1}}
-.toast.success{border-color:rgba(63,214,138,.3);color:var(--gr)}
-.toast.error{border-color:rgba(255,85,85,.3);color:var(--rd)}
-.toast.warn{border-color:rgba(255,217,61,.3);color:var(--yw)}
-/* SECTION TITLE */
-.pg-title{font-size:16px;font-weight:800;color:#fff;margin-bottom:14px}
-.tbtn{padding:8px 12px;border-radius:9px;border:1px solid var(--bd);background:var(--s2);color:var(--tx);font-size:12px;cursor:pointer;white-space:nowrap;display:inline-flex;align-items:center;gap:5px}
-.tbtn.p{background:var(--ac);border-color:var(--ac);color:#fff}
-.tbtn.d{border-color:rgba(255,85,85,.3);color:var(--rd)}
+.toast.success{border-left-color:var(--gr);color:var(--gr)}
+.toast.error{border-left-color:var(--rd);color:var(--rd)}
+.toast.warn{border-left-color:var(--yw);color:var(--yw)}
+
+/* SEARCH RESULTS */
+.srow{padding:12px 14px;background:var(--s2);border:1px solid var(--bd);border-radius:10px;margin-bottom:6px;cursor:pointer;transition:.12s}
+.srow:active{background:var(--s3)}
+.srow-p{font-size:11px;color:var(--ac);margin-bottom:3px;font-weight:600}
+.srow-m{font-size:12px;color:var(--mu)}
 </style></head><body>
 
-<!-- TOP NAV -->
-<div class="topnav">
-  <div class="tn-logo">🤖</div>
-  <div class="tn-title">${pname}</div>
-  <div class="tn-status"><div class="tn-dot" id="tnDot"></div><span id="tnStatus">লোড হচ্ছে...</span></div>
-  <button class="tn-logout" onclick="location.href='/logout'">বের হন</button>
+<!-- TOP -->
+<div class="top">
+  <div class="top-logo">🤖</div>
+  <div class="top-name">${pname}</div>
+  <div class="top-pill"><div class="dot" id="tDot"></div><span id="tStatus">লোড...</span></div>
+  <button class="top-out" onclick="location.href='/logout'">বের হন</button>
 </div>
 
 <!-- MAIN -->
@@ -383,74 +503,87 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',sans-serif;min-
 
 <!-- HOME -->
 <div id="pg-home" class="page active">
-  <div class="card-grid">
-    <div class="card"><div class="ci">💾</div><div class="cv" id="cMem">--</div><div class="cl">Memory MB</div></div>
-    <div class="card"><div class="ci">⏱️</div><div class="cv" id="cSup">--</div><div class="cl">Server Uptime</div></div>
-    <div class="card"><div class="ci">📦</div><div class="cv" id="cFiles">--</div><div class="cl">ফাইল</div></div>
-    <div class="card"><div class="ci">🚀</div><div class="cv" id="cStarts">--</div><div class="cl">মোট Start</div></div>
+  <div class="sg">
+    <div class="sc"><div class="sc-i">💾</div><div class="sc-v" id="cMem">--</div><div class="sc-l">Memory MB</div></div>
+    <div class="sc"><div class="sc-i">⏱️</div><div class="sc-v" id="cSup">--</div><div class="sc-l">Server Uptime</div></div>
+    <div class="sc"><div class="sc-i">📦</div><div class="sc-v" id="cFiles">--</div><div class="sc-l">বট ফাইল</div></div>
+    <div class="sc"><div class="sc-i">🚀</div><div class="sc-v" id="cStarts">--</div><div class="sc-l">মোট Start</div></div>
   </div>
-  <div class="bot-card">
-    <div class="status-row">
-      <div class="sdot" id="sDot"></div>
-      <div><div class="stxt" id="sTxt">চেক করছে...</div><div class="sup" id="sUp"></div></div>
+
+  <!-- COOKIE QUICK ADD -->
+  <div class="cookie-box">
+    <div class="cookie-title">🍪 Facebook Cookie / Appstate</div>
+    <div class="cookie-sub">Cookie বা appstate.json paste করুন → বট চালু করুন</div>
+    <textarea class="cookie-input" id="cookieInput" placeholder='[{"key":"c_user","value":"..."}] অথবা plain cookie string'></textarea>
+    <button class="btn b-start" style="margin-top:8px" onclick="saveCookie()">✅ Cookie সেভ ও বট চালু করুন</button>
+  </div>
+
+  <!-- BOT CONTROL -->
+  <div class="bc">
+    <div class="bst">
+      <div class="dot" id="sDot"></div>
+      <div class="bst-info">
+        <div class="bst-txt" id="sTxt">চেক করছে...</div>
+        <div class="bst-up" id="sUp"></div>
+      </div>
     </div>
-    <div class="btn-grid">
-      <button class="btn btn-start"   onclick="botAct('start')">▶ চালু</button>
-      <button class="btn btn-stop"    onclick="botAct('stop')">⏹ বন্ধ</button>
-      <button class="btn btn-restart" onclick="botAct('restart')">🔄 রিস্টার্ট</button>
-      <button class="btn btn-install" onclick="npmInst()">📦 npm install</button>
+    <div class="bg2">
+      <button class="btn b-start"   onclick="botAct('start')">▶ চালু</button>
+      <button class="btn b-stop"    onclick="botAct('stop')">⏹ বন্ধ</button>
     </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
-      <button class="btn btn-backup" onclick="doBackup()">💾 Backup</button>
-      <button class="btn btn-outline" onclick="openLogs()">📋 লগ দেখুন</button>
+    <div class="bg3" style="margin-top:8px">
+      <button class="btn b-restart" onclick="botAct('restart')">🔄 রিস্টার্ট</button>
+      <button class="btn b-npm"     onclick="npmInst()">📦 npm</button>
+      <button class="btn b-backup"  onclick="doBackup()">💾 Backup</button>
     </div>
     <div class="tog-row">
-      <div><div style="font-size:13px">Auto Restart</div><div style="font-size:11px;color:var(--mu)">Crash হলে অটো চালু</div></div>
-      <label class="tog"><input type="checkbox" id="arTog" onchange="toggleAR(this.checked)"><div class="togbg"></div><div class="togdot"></div></label>
+      <div><div style="font-size:13px;font-weight:600">Auto Restart</div><div style="font-size:11px;color:var(--mu);margin-top:2px">Crash হলে অটো চালু</div></div>
+      <label class="tog"><input type="checkbox" id="arTog" onchange="toggleAR(this.checked)"><div class="tog-bg"></div><div class="tog-dot"></div></label>
     </div>
   </div>
-  <!-- STATS -->
-  <div style="background:var(--s2);border:1px solid var(--bd);border-radius:16px;padding:16px">
-    <div style="font-size:13px;font-weight:700;margin-bottom:10px">📈 সাম্প্রতিক ইতিহাস</div>
-    <div id="histList"><div style="font-size:12px;color:var(--mu);text-align:center;padding:16px">ডেটা লোড হচ্ছে...</div></div>
+
+  <!-- HISTORY -->
+  <div class="bc">
+    <div class="pg-title">📈 Restart ইতিহাস</div>
+    <div class="hist" id="histList"><div style="font-size:12px;color:var(--mu);text-align:center;padding:16px">লোড হচ্ছে...</div></div>
   </div>
 </div>
 
 <!-- LOGS -->
 <div id="pg-logs" class="page">
-  <div class="log-topbar">
-    <button class="lf active" onclick="setLF('all',this)">সব</button>
+  <div class="log-bar">
+    <button class="lf on" onclick="setLF('all',this)">📋 সব</button>
     <button class="lf" onclick="setLF('success',this)">✅ Success</button>
     <button class="lf" onclick="setLF('error',this)">❌ Error</button>
     <button class="lf" onclick="setLF('warn',this)">⚠️ Warning</button>
     <button class="lf" onclick="clearLogs()">🗑 মুছুন</button>
     <button class="lf" onclick="window.open('/api/bot/downloadlog')">⬇️ Download</button>
   </div>
-  <div class="log-box" id="logBox"></div>
+  <div class="lbox" id="lbox"></div>
 </div>
 
 <!-- FILES -->
 <div id="pg-files" class="page">
   <div id="edView" style="display:none">
-    <div class="ed-header">
+    <div class="ed-top">
       <button class="tbtn" onclick="closeEd()">← ফিরে</button>
-      <span class="ed-fname" id="edFile"></span>
+      <span class="ed-fn" id="edFn"></span>
+      <span class="ed-lang" id="edLang"></span>
       <button class="tbtn p" onclick="saveFile()">💾 সেভ</button>
-      <button class="tbtn" onclick="downloadF(curEditPath)">⬇️</button>
+      <button class="tbtn" onclick="dlF(curEdit)">⬇️</button>
     </div>
-    <textarea id="codeEd" spellcheck="false"></textarea>
+    <textarea id="ced" spellcheck="false"></textarea>
   </div>
   <div id="fmView">
     <div class="pathbar" id="pathBar">📁 root</div>
-    <div class="fm-actions">
-      <button class="tbtn p" onclick="showMod('mkdir')">📁+ ফোল্ডার</button>
-      <button class="tbtn p" onclick="showMod('newfile')">📄+ ফাইল</button>
+    <div class="fm-acts">
+      <button class="tbtn p" onclick="showM('mkdir')">📁+</button>
+      <button class="tbtn p" onclick="showM('newfile')">📄+</button>
       <button class="tbtn" onclick="loadFiles(curDir)">🔄</button>
     </div>
-    <!-- SEARCH IN FILES -->
-    <input class="sinput" type="text" id="fSearchQ" placeholder="🔍 ফাইল খোঁজুন..." oninput="doFSearch()" style="margin-bottom:10px">
-    <div id="fSearchResults" style="display:none;margin-bottom:10px"></div>
-    <div class="flist" id="fileList"></div>
+    <input class="sinput" type="text" id="fq" placeholder="🔍 ফাইল খোঁজুন..." oninput="doFS()">
+    <div id="fsRes" style="display:none;margin-bottom:10px"></div>
+    <div class="flist" id="flist"></div>
   </div>
 </div>
 
@@ -458,10 +591,10 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',sans-serif;min-
 <div id="pg-upload" class="page">
   <div class="pg-title">⬆️ আপলোড</div>
   <div class="upzone" id="upZone" onclick="document.getElementById('fInp').click()">
-    <div class="ui">📦</div>
+    <div class="uz-i">📦</div>
     <div style="font-size:15px;font-weight:700;margin-bottom:6px">ক্লিক বা ড্র্যাগ করুন</div>
     <div style="color:var(--mu);font-size:13px">ZIP আপলোড করলে অটো extract হবে</div>
-    <div style="color:var(--bl);font-size:12px;margin-top:6px">সর্বোচ্চ ৫০০MB</div>
+    <div style="color:var(--bl);font-size:12px;margin-top:8px;font-weight:600">সর্বোচ্চ ৫০০MB • GitHub এর মতো সাজানো হবে</div>
   </div>
   <input type="file" id="fInp" style="display:none" onchange="uploadF(this.files[0])">
   <div class="prog-wrap" id="progWrap">
@@ -471,58 +604,50 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',sans-serif;min-
   </div>
 </div>
 
-<!-- MORE (ENV + SETTINGS) -->
+<!-- MORE -->
 <div id="pg-more" class="page">
   <!-- ENV -->
-  <div class="sc">
-    <div class="sc-title">⚙️ Environment (.env)</div>
-    <textarea id="envEd" spellcheck="false" placeholder="TOKEN=your_token&#10;COOKIE=your_cookie&#10;PREFIX=!"></textarea>
+  <div class="set-card">
+    <div class="set-title">⚙️ Environment (.env)</div>
+    <textarea id="envEd" spellcheck="false" placeholder="TOKEN=xxx&#10;COOKIE=xxx&#10;PREFIX=!&#10;ADMIN_ID=123456"></textarea>
     <div style="display:flex;gap:8px">
       <button class="tbtn p" onclick="saveEnv()">💾 সেভ</button>
       <button class="tbtn" onclick="loadEnv()">🔄 রিলোড</button>
     </div>
   </div>
   <!-- SETTINGS -->
-  <div class="sc">
-    <div class="sc-title">🔧 Settings</div>
-    <div class="srow2">
-      <div><div class="sl">Panel এর নাম</div></div>
+  <div class="set-card">
+    <div class="set-title">🔧 Settings</div>
+    <div class="set-row">
+      <div><div class="sr-l">Panel নাম</div></div>
       <input class="sinp" type="text" id="sName" placeholder="${pname}">
     </div>
-    <div class="srow2">
-      <div><div class="sl">Auto Restart</div><div class="sl2">Crash হলে অটো চালু</div></div>
-      <label class="tog"><input type="checkbox" id="sAR" onchange="toggleAR(this.checked)"><div class="togbg"></div><div class="togdot"></div></label>
+    <div class="set-row">
+      <div><div class="sr-l">Auto Restart</div><div class="sr-s">Crash হলে অটো</div></div>
+      <label class="tog"><input type="checkbox" id="sAR" onchange="toggleAR(this.checked)"><div class="tog-bg"></div><div class="tog-dot"></div></label>
     </div>
-    <div class="srow2">
-      <div><div class="sl">Schedule Restart</div><div class="sl2">প্রতিদিন নির্দিষ্ট সময়ে</div></div>
-      <label class="tog"><input type="checkbox" id="sSched"><div class="togbg"></div><div class="togdot"></div></label>
+    <div class="set-row">
+      <div><div class="sr-l">Schedule Restart</div><div class="sr-s">প্রতিদিন নির্দিষ্ট সময়ে</div></div>
+      <label class="tog"><input type="checkbox" id="sSched"><div class="tog-bg"></div><div class="tog-dot"></div></label>
     </div>
-    <div class="srow2">
-      <div><div class="sl">Restart সময়</div></div>
+    <div class="set-row">
+      <div><div class="sr-l">Restart সময়</div></div>
       <input class="sinp" type="time" id="sTime" value="03:00">
     </div>
-    <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+    <div style="margin-top:14px">
       <button class="tbtn p" onclick="saveSettings()">💾 সেভ</button>
     </div>
   </div>
   <!-- PASSWORD -->
-  <div class="sc">
-    <div class="sc-title">🔐 পাসওয়ার্ড পরিবর্তন</div>
-    <div class="srow2">
-      <div class="sl">বর্তমান</div>
-      <input class="sinp" type="password" id="sCur" placeholder="বর্তমান পাসওয়ার্ড">
-    </div>
-    <div class="srow2">
-      <div class="sl">নতুন</div>
-      <input class="sinp" type="password" id="sNew" placeholder="নতুন পাসওয়ার্ড">
-    </div>
-    <div style="margin-top:12px">
-      <button class="tbtn p" onclick="changePw()">🔐 পরিবর্তন করুন</button>
-    </div>
+  <div class="set-card">
+    <div class="set-title">🔐 পাসওয়ার্ড পরিবর্তন</div>
+    <div class="set-row"><div class="sr-l">বর্তমান</div><input class="sinp" type="password" id="sCur" placeholder="বর্তমান"></div>
+    <div class="set-row"><div class="sr-l">নতুন</div><input class="sinp" type="password" id="sNew" placeholder="নতুন (কমপক্ষে ৪)"></div>
+    <div style="margin-top:14px"><button class="tbtn p" onclick="changePw()">🔐 পরিবর্তন</button></div>
   </div>
   <!-- MAINTENANCE -->
-  <div class="sc">
-    <div class="sc-title">🛠️ Maintenance</div>
+  <div class="set-card">
+    <div class="set-title">🛠️ Maintenance</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <button class="tbtn" onclick="doBackup()">💾 Full Backup</button>
       <button class="tbtn d" onclick="clearLogFile()">🗑 Log মুছুন</button>
@@ -530,10 +655,10 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',sans-serif;min-
   </div>
 </div>
 
-</div><!-- /main -->
+</div>
 
-<!-- BOTTOM TAB BAR -->
-<div class="tabbar">
+<!-- BOTTOM TABS -->
+<div class="tabs">
   <button class="tab active" onclick="goTab('home',this)"><span class="ti">🏠</span><span class="tl">হোম</span></button>
   <button class="tab" onclick="goTab('logs',this)"><span class="ti">📋</span><span class="tl">লগ</span></button>
   <button class="tab" onclick="goTab('files',this)"><span class="ti">📁</span><span class="tl">ফাইল</span></button>
@@ -542,15 +667,15 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',sans-serif;min-
 </div>
 
 <!-- MODALS -->
-<div class="mbg" id="mod-mkdir"><div class="modal"><h3>📁 নতুন ফোল্ডার</h3><input type="text" id="mkN" placeholder="ফোল্ডারের নাম"><div class="modal-btns"><button class="tbtn" onclick="closeMod('mkdir')">বাতিল</button><button class="tbtn p" onclick="doMkdir()">তৈরি করুন</button></div></div></div>
-<div class="mbg" id="mod-newfile"><div class="modal"><h3>📄 নতুন ফাইল</h3><input type="text" id="nfN" placeholder="ফাইলের নাম (test.js)"><div class="modal-btns"><button class="tbtn" onclick="closeMod('newfile')">বাতিল</button><button class="tbtn p" onclick="doNewFile()">তৈরি করুন</button></div></div></div>
-<div class="mbg" id="mod-rename"><div class="modal"><h3>✏️ নাম পরিবর্তন</h3><input type="text" id="rnV" placeholder="নতুন নাম"><div class="modal-btns"><button class="tbtn" onclick="closeMod('rename')">বাতিল</button><button class="tbtn p" onclick="doRename()">পরিবর্তন</button></div></div></div>
+<div class="mbg" id="mod-mkdir"><div class="modal"><h3>📁 নতুন ফোল্ডার</h3><input type="text" id="mkN" placeholder="ফোল্ডারের নাম"><div class="modal-btns"><button class="tbtn" onclick="closeM('mkdir')">বাতিল</button><button class="tbtn p" onclick="doMkdir()">তৈরি করুন</button></div></div></div>
+<div class="mbg" id="mod-newfile"><div class="modal"><h3>📄 নতুন ফাইল</h3><input type="text" id="nfN" placeholder="ফাইলের নাম (test.js)"><div class="modal-btns"><button class="tbtn" onclick="closeM('newfile')">বাতিল</button><button class="tbtn p" onclick="doNewFile()">তৈরি করুন</button></div></div></div>
+<div class="mbg" id="mod-rename"><div class="modal"><h3>✏️ নাম পরিবর্তন</h3><input type="text" id="rnV" placeholder="নতুন নাম"><div class="modal-btns"><button class="tbtn" onclick="closeM('rename')">বাতিল</button><button class="tbtn p" onclick="doRename()">পরিবর্তন</button></div></div></div>
 
 <div class="tw" id="tw"></div>
 
 <script>
 // STATE
-let curDir="",curEditPath="",renameFrom="",logFilter="all",autoScroll=true;
+let curDir="",curEdit="",renameFrom="",logFilter="all",autoScroll=true;
 let ws;
 
 // TABS
@@ -561,13 +686,7 @@ function goTab(id,btn){
   document.getElementById("pg-"+id).classList.add("active");
   if(id==="files") loadFiles(curDir);
   if(id==="more"){loadEnv();loadSettings();}
-  if(id==="logs") document.getElementById("logBox").scrollTop=document.getElementById("logBox").scrollHeight;
-}
-
-function openLogs(){
-  document.querySelectorAll(".tab").forEach((t,i)=>t.classList.toggle("active",i===1));
-  document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));
-  document.getElementById("pg-logs").classList.add("active");
+  if(id==="logs") document.getElementById("lbox").scrollTop=document.getElementById("lbox").scrollHeight;
 }
 
 // WS
@@ -577,90 +696,98 @@ function connectWS(){
   ws.onmessage=e=>{
     const m=JSON.parse(e.data);
     if(m.type==="log") appendLog(m.data);
-    if(m.type==="logs"){document.getElementById("logBox").innerHTML="";m.data.forEach(appendLog);}
+    if(m.type==="logs"){document.getElementById("lbox").innerHTML="";m.data.forEach(appendLog);}
     if(m.type==="status") updateStatus(m.running);
-    if(m.type==="clearLogs") document.getElementById("logBox").innerHTML="";
+    if(m.type==="clearLogs") document.getElementById("lbox").innerHTML="";
   };
   ws.onclose=()=>setTimeout(connectWS,3000);
 }
 
 function appendLog(e){
-  if(logFilter!=="all"&&e.type!==logFilter) return;
-  const box=document.getElementById("logBox");
+  if(logFilter!=="all"&&e.type!==logFilter)return;
+  const box=document.getElementById("lbox");
   const d=document.createElement("div");
-  d.className="le log-"+(e.type||"info");d.dataset.type=e.type||"info";
+  const cls={info:"li",success:"ls",error:"lr",warn:"lw"}[e.type||"info"]||"li";
+  d.className="le "+cls; d.dataset.t=e.type||"info";
   d.innerHTML='<span class="lt">'+e.time+'</span><span class="lx">'+esc(e.text)+'</span>';
   box.appendChild(d);
   if(autoScroll) box.scrollTop=box.scrollHeight;
 }
 
 function esc(t){return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
-
-function setLF(f,btn){
-  logFilter=f;
-  document.querySelectorAll(".lf").forEach(b=>b.classList.remove("active"));
-  btn.classList.add("active");
-  document.querySelectorAll(".le").forEach(el=>el.style.display=(f==="all"||el.dataset.type===f)?"flex":"none");
-}
-
+function setLF(f,btn){logFilter=f;document.querySelectorAll(".lf").forEach(b=>b.classList.remove("on"));btn.classList.add("on");document.querySelectorAll(".le").forEach(el=>el.style.display=(f==="all"||el.dataset.t===f)?"flex":"none");}
 function clearLogs(){fetch("/api/bot/clearlogs",{method:"POST"});}
 function clearLogFile(){if(!confirm("Log file মুছবেন?"))return;fetch("/api/bot/clearlogfile",{method:"POST"}).then(r=>r.json()).then(d=>toast(d.ok?"✅ মুছা হয়েছে":"❌ ব্যর্থ",d.ok?"success":"error"));}
 
 // STATUS
 function updateStatus(running){
-  document.querySelectorAll(".sdot,.tn-dot").forEach(d=>d.className=(d.classList.contains("tn-dot")?"tn-dot":"sdot")+(running?" on":""));
+  [document.getElementById("sDot"),document.getElementById("tDot")].forEach(d=>{if(d){d.className="dot"+(running?" on":"");}});
   const st=document.getElementById("sTxt");if(st) st.textContent=running?"✅ বট চলছে":"🔴 বট বন্ধ";
-  const ts=document.getElementById("tnStatus");if(ts) ts.textContent=running?"✅ চলছে":"🔴 বন্ধ";
+  const ts=document.getElementById("tStatus");if(ts) ts.textContent=running?"✅ চলছে":"🔴 বন্ধ";
 }
 
 function fmtT(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sc=s%60;return h>0?h+"h "+m+"m":m>0?m+"m "+sc+"s":sc+"s";}
-function fsz(b){if(!b)return"—";if(b<1024)return b+"B";if(b<1048576)return(b/1024).toFixed(1)+"KB";return(b/1048576).toFixed(1)+"MB";}
-function fdt(d){return new Date(d).toLocaleDateString("bn-BD",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});}
+function fsz(b){if(!b||b===0)return"—";if(b<1024)return b+"B";if(b<1048576)return(b/1024).toFixed(1)+"KB";return(b/1048576).toFixed(1)+"MB";}
+function fdt(d){try{return new Date(d).toLocaleDateString("bn-BD",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});}catch{return"";}}
 
-async function refreshAll(){
-  const[st,bs]=await Promise.all([fetch("/api/stats").then(r=>r.json()),fetch("/api/bot/status").then(r=>r.json())]);
-  document.getElementById("cMem").textContent=st.memMB;
-  document.getElementById("cSup").textContent=fmtT(st.serverUptime);
-  document.getElementById("cFiles").textContent=st.botFiles;
-  document.getElementById("cStarts").textContent=st.starts||0;
-  updateStatus(bs.running);
-  const sup=document.getElementById("sUp");if(sup) sup.textContent=bs.running&&bs.uptime>0?"চলছে: "+fmtT(bs.uptime):"";
-  const ar=document.getElementById("arTog");if(ar) ar.checked=st.autoRestart||false;
-  const sar=document.getElementById("sAR");if(sar) sar.checked=st.autoRestart||false;
-  // history
-  const hist=(st.history||[]).slice().reverse().slice(0,5);
-  document.getElementById("histList").innerHTML=hist.length
-    ?hist.map(h=>'<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:12px"><span style="color:var(--mu)">'+new Date(h.date).toLocaleString("bn-BD").substring(0,16)+'</span><span style="color:var(--gr)">'+fmtT(h.uptime)+'</span></div>').join("")
-    :'<div style="font-size:12px;color:var(--mu);text-align:center;padding:10px">কোনো ইতিহাস নেই</div>';
+async function refresh(){
+  try{
+    const[st,bs]=await Promise.all([fetch("/api/stats").then(r=>r.json()),fetch("/api/bot/status").then(r=>r.json())]);
+    document.getElementById("cMem").textContent=st.memMB||"--";
+    document.getElementById("cSup").textContent=fmtT(st.serverUptime||0);
+    document.getElementById("cFiles").textContent=st.botFiles||0;
+    document.getElementById("cStarts").textContent=st.starts||0;
+    updateStatus(bs.running);
+    const sup=document.getElementById("sUp");
+    if(sup) sup.textContent=bs.running&&bs.uptime>0?"⏱ চলছে: "+fmtT(bs.uptime):"";
+    [document.getElementById("arTog"),document.getElementById("sAR")].forEach(el=>{if(el)el.checked=st.autoRestart||false;});
+    const hist=(st.history||[]).slice().reverse().slice(0,8);
+    const hl=document.getElementById("histList");
+    if(hl) hl.innerHTML=hist.length
+      ?hist.map(h=>'<div class="hi"><span class="hi-date">'+new Date(h.date).toLocaleString("bn-BD").substring(0,16)+'</span><span class="hi-up">'+fmtT(h.uptime)+'</span><span class="hi-code">'+h.code+'</span></div>').join("")
+      :'<div style="font-size:12px;color:var(--mu);text-align:center;padding:12px">কোনো ইতিহাস নেই</div>';
+  }catch{}
 }
 
 // BOT
 async function botAct(a){
-  toast("⏳ "+a+"...","warn");
+  toast("⏳ "+{start:"চালু",stop:"বন্ধ",restart:"রিস্টার্ট"}[a]+" করছে...","warn");
   const d=await fetch("/api/bot/"+a,{method:"POST"}).then(r=>r.json());
   toast(d.ok?"✅ "+d.msg:"❌ "+d.msg,d.ok?"success":"error");
+  setTimeout(refresh,2500);
 }
 async function npmInst(){toast("📦 npm install শুরু...","warn");const d=await fetch("/api/bot/install",{method:"POST"}).then(r=>r.json());toast(d.ok?"✅ "+d.msg:"❌ "+d.msg,d.ok?"success":"error");}
 function doBackup(){window.open("/api/backup");}
 async function toggleAR(v){
   await fetch("/api/bot/autorestart",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:v})});
-  toast(v?"✅ Auto Restart চালু":"⚠️ বন্ধ",v?"success":"warn");
+  toast(v?"✅ Auto Restart চালু":"⚠️ Auto Restart বন্ধ",v?"success":"warn");
   [document.getElementById("arTog"),document.getElementById("sAR")].forEach(el=>{if(el)el.checked=v;});
 }
 
-// FILE MANAGER
+// COOKIE
+async function saveCookie(){
+  const c=document.getElementById("cookieInput").value.trim();
+  if(!c)return toast("❌ Cookie লিখুন","error");
+  const d=await fetch("/api/cookie/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cookie:c})}).then(r=>r.json());
+  toast(d.ok?"✅ "+d.msg:"❌ "+d.msg,d.ok?"success":"error");
+  if(d.ok){document.getElementById("cookieInput").value="";setTimeout(()=>botAct("start"),1000);}
+}
+
+// FILE ICONS
 function ficon(name,isDir){
   if(isDir)return"📁";
   const e=name.split(".").pop().toLowerCase();
-  return{js:"📜",json:"📋",md:"📝",txt:"📄",env:"🔐",log:"📋",jpg:"🖼",png:"🖼",gif:"🖼",mp3:"🎵",mp4:"🎬",zip:"📦",html:"🌐",css:"🎨",ts:"📘",py:"🐍",sh:"⚡",yml:"⚙️"}[e]||"📄";
+  return{js:"📜",mjs:"📜",cjs:"📜",json:"📋",md:"📝",txt:"📄",env:"🔐",log:"📋",jpg:"🖼",jpeg:"🖼",png:"🖼",gif:"🖼",webp:"🖼",mp3:"🎵",mp4:"🎬",zip:"📦",tar:"📦",gz:"📦",html:"🌐",css:"🎨",ts:"📘",py:"🐍",sh:"⚡",bat:"⚡",yml:"⚙️",yaml:"⚙️",xml:"📋",lock:"🔒",gitignore:"👁️",npmrc:"⚙️"}[e]||"📄";
 }
+
+function langFromExt(n){const e=n.split(".").pop().toLowerCase();return{js:"JavaScript",json:"JSON",md:"Markdown",html:"HTML",css:"CSS",py:"Python",ts:"TypeScript",sh:"Shell",env:"ENV",txt:"Text",yml:"YAML",xml:"XML",gitignore:"GitIgnore"}[e]||e.toUpperCase();}
 
 function buildPath(dir){
   const bar=document.getElementById("pathBar");
   const parts=dir?dir.split("/"):[];
   let html='<span class="pp" onclick="loadFiles(\\'\\')">📁 root</span>';
   let acc="";
-  parts.forEach(p=>{acc+=(acc?"/":"")+p;const c=acc;html+=' / <span class="pp" onclick="loadFiles(\\''+c+'\\')">'+p+'</span>';});
+  parts.forEach(p=>{acc+=(acc?"/":"")+p;const c=acc;html+='<span style="color:var(--mu)"> / </span><span class="pp" onclick="loadFiles(\\''+c+'\\')">'+p+'</span>';});
   bar.innerHTML=html;
 }
 
@@ -668,27 +795,27 @@ async function loadFiles(dir){
   curDir=dir||"";buildPath(curDir);
   document.getElementById("fmView").style.display="block";
   document.getElementById("edView").style.display="none";
-  document.getElementById("fSearchResults").style.display="none";
-  document.getElementById("fSearchQ").value="";
+  document.getElementById("fsRes").style.display="none";
+  document.getElementById("fq").value="";
   const data=await fetch("/api/files?path="+encodeURIComponent(curDir)).then(r=>r.json());
-  const list=document.getElementById("fileList");list.innerHTML="";
+  const list=document.getElementById("flist");list.innerHTML="";
   if(curDir){
     const up=document.createElement("div");up.className="frow";
-    up.innerHTML='<span class="ficon">⬆️</span><div class="frow-info"><div class="frow-name">.. উপরে যান</div></div>';
+    up.innerHTML='<span class="fi">⬆️</span><div class="fn"><div class="fn-name">.. উপরে যান</div></div>';
     up.onclick=()=>loadFiles(curDir.split("/").slice(0,-1).join("/"));
     list.appendChild(up);
   }
-  if(!data.items?.length){list.innerHTML='<div class="empty"><div class="eb">📭</div><div>ফোল্ডার খালি</div></div>';return;}
+  if(!data.items?.length){list.innerHTML='<div class="empty-fm"><div class="ei">📭</div><div>ফোল্ডার খালি</div></div>';return;}
   data.items.forEach(item=>{
     const fp=curDir?curDir+"/"+item.name:item.name;
     const row=document.createElement("div");row.className="frow";
-    row.innerHTML='<span class="ficon">'+ficon(item.name,item.isDir)+'</span>'
-      +'<div class="frow-info"><div class="frow-name">'+item.name+'</div><div class="frow-meta">'+fsz(item.size)+(item.mtime?" · "+fdt(item.mtime):"")+'</div></div>'
-      +'<div class="frow-acts">'
-      +(item.isDir?'':'<button class="fa" onclick="event.stopPropagation();editF(\\''+fp+'\\')">✏️</button>')
-      +'<button class="fa" onclick="event.stopPropagation();downloadF(\\''+fp+'\\')">⬇️</button>'
-      +'<button class="fa" onclick="event.stopPropagation();showRename(\\''+fp+'\\',\\''+item.name+'\\')">🔤</button>'
-      +'<button class="fa del" onclick="event.stopPropagation();delItem(\\''+fp+'\\',\\''+item.name+'\\')">🗑</button>'
+    row.innerHTML='<span class="fi">'+ficon(item.name,item.isDir)+'</span>'
+      +'<div class="fn"><div class="fn-name">'+item.name+'</div><div class="fn-meta">'+fsz(item.size)+(item.mtime?" · "+fdt(item.mtime):"")+'</div></div>'
+      +'<div class="fa">'
+      +(item.isDir?'':'<button class="fab" onclick="event.stopPropagation();editF(\\''+fp+'\\')">✏️</button>')
+      +'<button class="fab" onclick="event.stopPropagation();dlF(\\''+fp+'\\')">⬇️</button>'
+      +'<button class="fab" onclick="event.stopPropagation();showRename(\\''+fp+'\\',\\''+item.name+'\\')">🔤</button>'
+      +'<button class="fab del" onclick="event.stopPropagation();delItem(\\''+fp+'\\',\\''+item.name+'\\')">🗑</button>'
       +'</div>';
     if(item.isDir) row.onclick=()=>loadFiles(fp);
     else row.onclick=()=>editF(fp);
@@ -699,18 +826,19 @@ async function loadFiles(dir){
 async function editF(p){
   const d=await fetch("/api/file/read?path="+encodeURIComponent(p)).then(r=>r.json());
   if(d.error)return toast("❌ "+d.error,"error");
-  curEditPath=p;
-  document.getElementById("edFile").textContent=p.split("/").pop();
-  document.getElementById("codeEd").value=d.content;
+  curEdit=p;
+  document.getElementById("edFn").textContent=p.split("/").pop();
+  document.getElementById("edLang").textContent=langFromExt(p);
+  document.getElementById("ced").value=d.content;
   document.getElementById("fmView").style.display="none";
   document.getElementById("edView").style.display="block";
 }
 function closeEd(){document.getElementById("edView").style.display="none";document.getElementById("fmView").style.display="block";}
 async function saveFile(){
-  const d=await fetch("/api/file/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:curEditPath,content:document.getElementById("codeEd").value})}).then(r=>r.json());
+  const d=await fetch("/api/file/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:curEdit,content:document.getElementById("ced").value})}).then(r=>r.json());
   toast(d.ok?"✅ সেভ হয়েছে":"❌ "+d.error,d.ok?"success":"error");
 }
-function downloadF(p){window.open("/api/file/download?path="+encodeURIComponent(p));}
+function dlF(p){window.open("/api/file/download?path="+encodeURIComponent(p));}
 async function delItem(p,name){
   if(!confirm('"'+name+'" ডিলিট করবেন?'))return;
   const d=await fetch("/api/file/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:p})}).then(r=>r.json());
@@ -718,36 +846,42 @@ async function delItem(p,name){
 }
 
 // FILE SEARCH
-let fsTimeout;
-function doFSearch(){
-  const q=document.getElementById("fSearchQ").value.trim();
-  const res=document.getElementById("fSearchResults");
+let fst;
+function doFS(){
+  const q=document.getElementById("fq").value.trim();
+  const res=document.getElementById("fsRes");
   if(!q){res.style.display="none";return;}
-  clearTimeout(fsTimeout);fsTimeout=setTimeout(async()=>{
+  clearTimeout(fst);fst=setTimeout(async()=>{
     const d=await fetch("/api/file/search?q="+encodeURIComponent(q)).then(r=>r.json());
     if(!d.results?.length){res.style.display="block";res.innerHTML='<div style="font-size:12px;color:var(--mu);padding:10px;text-align:center">📭 পাওয়া যায়নি</div>';return;}
     res.style.display="block";
-    res.innerHTML=d.results.map(r=>'<div class="srow" onclick="'+(r.isDir?"loadFiles('"+r.path+"')":"editF('"+r.path+"')")+'"><div class="srow-path">'+ficon(r.name,r.isDir)+' '+r.path+'</div><div class="srow-text">'+fsz(r.size)+'</div></div>').join("");
+    res.innerHTML=d.results.map(r=>'<div class="srow" onclick="'+(r.isDir?"loadFiles('"+r.path+"')":"editF('"+r.path+"')")+'"><div class="srow-p">'+ficon(r.name,r.isDir)+" "+r.path+'</div><div class="srow-m">'+fsz(r.size)+'</div></div>').join("");
   },300);
 }
 
 // MODALS
-function showMod(id){document.getElementById("mod-"+id).classList.add("open");setTimeout(()=>document.querySelector("#mod-"+id+" input")?.focus(),100);}
-function closeMod(id){document.getElementById("mod-"+id).classList.remove("open");}
-async function doMkdir(){const n=document.getElementById("mkN").value.trim();if(!n)return;const fp=curDir?curDir+"/"+n:n;const d=await fetch("/api/file/mkdir",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:fp})}).then(r=>r.json());closeMod("mkdir");toast(d.ok?"📁 তৈরি":"❌ "+d.error,d.ok?"success":"error");if(d.ok)loadFiles(curDir);}
-async function doNewFile(){const n=document.getElementById("nfN").value.trim();if(!n)return;const fp=curDir?curDir+"/"+n:n;const d=await fetch("/api/file/newfile",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:fp,content:""})}).then(r=>r.json());closeMod("newfile");if(d.ok){toast("📄 তৈরি","success");editF(fp);}else toast("❌ "+d.error,"error");}
-function showRename(p,name){renameFrom=p;document.getElementById("rnV").value=name;showMod("rename");}
-async function doRename(){const n=document.getElementById("rnV").value.trim();if(!n)return;const dir=renameFrom.includes("/")?renameFrom.split("/").slice(0,-1).join("/"):"";const to=dir?dir+"/"+n:n;const d=await fetch("/api/file/rename",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({from:renameFrom,to})}).then(r=>r.json());closeMod("rename");toast(d.ok?"✅ নাম পরিবর্তন":"❌ "+d.error,d.ok?"success":"error");if(d.ok)loadFiles(curDir);}
+function showM(id){document.getElementById("mod-"+id).classList.add("open");setTimeout(()=>document.querySelector("#mod-"+id+" input")?.focus(),100);}
+function closeM(id){document.getElementById("mod-"+id).classList.remove("open");}
+async function doMkdir(){const n=document.getElementById("mkN").value.trim();if(!n)return;const fp=curDir?curDir+"/"+n:n;const d=await fetch("/api/file/mkdir",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:fp})}).then(r=>r.json());closeM("mkdir");toast(d.ok?"📁 তৈরি":"❌ "+d.error,d.ok?"success":"error");if(d.ok)loadFiles(curDir);}
+async function doNewFile(){const n=document.getElementById("nfN").value.trim();if(!n)return;const fp=curDir?curDir+"/"+n:n;const d=await fetch("/api/file/newfile",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:fp,content:""})}).then(r=>r.json());closeM("newfile");if(d.ok){toast("📄 তৈরি","success");editF(fp);}else toast("❌ "+d.error,"error");}
+function showRename(p,name){renameFrom=p;document.getElementById("rnV").value=name;showM("rename");}
+async function doRename(){const n=document.getElementById("rnV").value.trim();if(!n)return;const dir=renameFrom.includes("/")?renameFrom.split("/").slice(0,-1).join("/"):"";const to=dir?dir+"/"+n:n;const d=await fetch("/api/file/rename",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({from:renameFrom,to})}).then(r=>r.json());closeM("rename");toast(d.ok?"✅ নাম পরিবর্তন":"❌ "+d.error,d.ok?"success":"error");if(d.ok)loadFiles(curDir);}
 
 // UPLOAD
 async function uploadF(file){
   if(!file)return;
   const pw=document.getElementById("progWrap"),pb=document.getElementById("progBar"),pp=document.getElementById("upPct"),ps=document.getElementById("upSt"),fn=document.getElementById("upFN");
-  pw.style.display="block";fn.textContent=file.name;pb.style.width="0%";pp.textContent="0%";ps.textContent="আপলোড শুরু হচ্ছে...";
+  pw.style.display="block";fn.textContent=file.name;pb.style.width="0%";pp.textContent="0%";ps.textContent="প্রস্তুত হচ্ছে...";
   const fd=new FormData();fd.append("file",file);fd.append("path",curDir||"");
   const xhr=new XMLHttpRequest();xhr.open("POST","/api/file/upload");
   xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);pb.style.width=p+"%";pp.textContent=p+"%";ps.textContent=fsz(e.loaded)+" / "+fsz(e.total);}};
-  xhr.onload=()=>{const d=JSON.parse(xhr.responseText);if(d.ok){pb.style.width="100%";pp.textContent="100%";ps.innerHTML='<span style="color:var(--gr)">✅ '+(d.msg||"সম্পন্ন")+'</span>';toast("✅ "+(d.msg||"আপলোড সম্পন্ন"),"success");}else{ps.innerHTML='<span style="color:var(--rd)">❌ '+d.error+'</span>';toast("❌ "+d.error,"error");}document.getElementById("fInp").value="";};
+  xhr.onload=()=>{
+    const d=JSON.parse(xhr.responseText);
+    if(d.ok){pb.style.width="100%";pp.textContent="100%";ps.innerHTML='<span style="color:var(--gr)">✅ '+(d.msg||"সম্পন্ন")+'</span>';toast("✅ "+(d.msg||"আপলোড সম্পন্ন"),"success");}
+    else{ps.innerHTML='<span style="color:var(--rd)">❌ '+(d.error||"ব্যর্থ")+'</span>';toast("❌ "+(d.error||"আপলোড ব্যর্থ"),"error");}
+    document.getElementById("fInp").value="";
+  };
+  xhr.onerror=()=>{ps.innerHTML='<span style="color:var(--rd)">❌ নেটওয়ার্ক সমস্যা</span>';};
   xhr.send(fd);
 }
 const uz=document.getElementById("upZone");
@@ -760,19 +894,40 @@ async function loadEnv(){const d=await fetch("/api/env").then(r=>r.json());docum
 async function saveEnv(){const d=await fetch("/api/env/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:document.getElementById("envEd").value})}).then(r=>r.json());toast(d.ok?"✅ .env সেভ":"❌ "+d.msg,d.ok?"success":"error");}
 
 // SETTINGS
-async function loadSettings(){const d=await fetch("/api/settings").then(r=>r.json());document.getElementById("sName").value=d.panelName||"";document.getElementById("sAR").checked=d.autoRestart||false;document.getElementById("sSched").checked=d.scheduleRestart||false;document.getElementById("sTime").value=d.scheduleTime||"03:00";}
-async function saveSettings(){const body={panelName:document.getElementById("sName").value,autoRestart:document.getElementById("sAR").checked,scheduleRestart:document.getElementById("sSched").checked,scheduleTime:document.getElementById("sTime").value};const d=await fetch("/api/settings/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(r=>r.json());toast(d.ok?"✅ সেভ হয়েছে":"❌ ব্যর্থ",d.ok?"success":"error");}
-async function changePw(){const d=await fetch("/api/settings/password",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({current:document.getElementById("sCur").value,newPass:document.getElementById("sNew").value})}).then(r=>r.json());toast(d.ok?"✅ "+d.msg:"❌ "+d.msg,d.ok?"success":"error");if(d.ok){document.getElementById("sCur").value="";document.getElementById("sNew").value="";}}
+async function loadSettings(){
+  const d=await fetch("/api/settings").then(r=>r.json());
+  document.getElementById("sName").value=d.panelName||"";
+  document.getElementById("sAR").checked=d.autoRestart||false;
+  document.getElementById("sSched").checked=d.scheduleRestart||false;
+  document.getElementById("sTime").value=d.scheduleTime||"03:00";
+}
+async function saveSettings(){
+  const body={panelName:document.getElementById("sName").value,autoRestart:document.getElementById("sAR").checked,scheduleRestart:document.getElementById("sSched").checked,scheduleTime:document.getElementById("sTime").value};
+  const d=await fetch("/api/settings/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(r=>r.json());
+  toast(d.ok?"✅ সেভ হয়েছে":"❌ ব্যর্থ",d.ok?"success":"error");
+}
+async function changePw(){
+  const d=await fetch("/api/settings/password",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({current:document.getElementById("sCur").value,newPass:document.getElementById("sNew").value})}).then(r=>r.json());
+  toast(d.ok?"✅ "+d.msg:"❌ "+d.msg,d.ok?"success":"error");
+  if(d.ok){document.getElementById("sCur").value="";document.getElementById("sNew").value="";}
+}
 
 // TOAST
-function toast(msg,type="success"){const w=document.getElementById("tw"),el=document.createElement("div");el.className="toast "+type;el.textContent=msg;w.appendChild(el);setTimeout(()=>{el.style.opacity="0";el.style.transition=".3s";setTimeout(()=>el.remove(),300);},3500);}
+function toast(msg,type="success"){
+  const w=document.getElementById("tw"),el=document.createElement("div");
+  el.className="toast "+type;el.textContent=msg;w.appendChild(el);
+  setTimeout(()=>{el.style.opacity="0";el.style.transition=".3s";setTimeout(()=>el.remove(),300);},4000);
+}
 
 // KEYBOARD
-document.addEventListener("keydown",e=>{if((e.ctrlKey||e.metaKey)&&e.key==="s"&&curEditPath){e.preventDefault();saveFile();}if(e.key==="Escape")document.querySelectorAll(".mbg.open").forEach(m=>m.classList.remove("open"));});
+document.addEventListener("keydown",e=>{
+  if((e.ctrlKey||e.metaKey)&&e.key==="s"&&curEdit){e.preventDefault();saveFile();}
+  if(e.key==="Escape") document.querySelectorAll(".mbg.open").forEach(m=>m.classList.remove("open"));
+});
 
 // INIT
 connectWS();
-refreshAll();
-setInterval(refreshAll,10000);
+refresh();
+setInterval(refresh,10000);
 </script>
 </body></html>`;}

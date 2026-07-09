@@ -152,10 +152,17 @@ app.get("/api/file/download",auth,(req,res)=>{
 app.post("/api/file/upload",auth,upload.single("file"),async(req,res)=>{
   try{const t=safeJoin(BOT_DIR,req.body.path||"");fs.mkdirSync(t,{recursive:true});
   if(req.file.originalname.endsWith(".zip")){
-    await new Promise((resolve,reject)=>fs.createReadStream(req.file.path).pipe(unzipper.Extract({path:t})).on("close",resolve).on("error",reject));
+    const tmpX="/tmp/extract_"+Date.now();
+    fs.mkdirSync(tmpX,{recursive:true});
+    await new Promise((resolve,reject)=>fs.createReadStream(req.file.path).pipe(unzipper.Extract({path:tmpX})).on("close",resolve).on("error",reject));
     fs.unlinkSync(req.file.path);
-    const mac=path.join(t,"__MACOSX");if(fs.existsSync(mac))fs.rmSync(mac,{recursive:true});
-    addLog("📦 ZIP extract → "+(req.body.path||"/"),"success");res.json({ok:true,msg:"ZIP extract সম্পন্ন ✅"});
+    const mac=path.join(tmpX,"__MACOSX");if(fs.existsSync(mac))fs.rmSync(mac,{recursive:true,force:true});
+    const entries=fs.readdirSync(tmpX).filter(f=>!f.startsWith("."));
+    let srcDir=tmpX;
+    if(entries.length===1){const s=path.join(tmpX,entries[0]);if(fs.statSync(s).isDirectory())srcDir=s;}
+    fs.readdirSync(srcDir).forEach(name=>{const from=path.join(srcDir,name),to=path.join(t,name);if(fs.existsSync(to))fs.rmSync(to,{recursive:true,force:true});fs.renameSync(from,to);});
+    fs.rmSync(tmpX,{recursive:true,force:true});
+    addLog("📦 ZIP extract সম্পন্ন → "+(req.body.path||"/"),"success");res.json({ok:true,msg:"ZIP extract সম্পন্ন ✅"});
   }else{fs.copyFileSync(req.file.path,path.join(t,req.file.originalname));fs.unlinkSync(req.file.path);res.json({ok:true,msg:"আপলোড সম্পন্ন ✅"});}
   }catch(e){res.status(500).json({error:e.message});}
 });

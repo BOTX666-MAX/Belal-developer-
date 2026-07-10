@@ -56,11 +56,15 @@ function startBot(by="manual"){
   if(botProc) return {ok:false,msg:"বট ইতিমধ্যে চলছে"};
   const idx=["index.js","app.js","main.js","bot.js","start.js"].find(f=>fs.existsSync(path.join(BDIR,f)));
   if(!idx) return {ok:false,msg:"index.js পাওয়া যায়নি — বট আপলোড করুন"};
-  if(!fs.existsSync(path.join(BDIR,"node_modules"))){
-    try{log("📦 npm install চলছে...","warn");execSync("npm install",{cwd:BDIR,timeout:180000});log("✅ npm install সম্পন্ন","success");}
+  // auto npm install if node_modules missing or package.json changed
+  const pkgFile=path.join(BDIR,"package.json");
+  const nmDir=path.join(BDIR,"node_modules");
+  const needInstall=!fs.existsSync(nmDir)||(fs.existsSync(pkgFile)&&fs.statSync(pkgFile).mtimeMs>(fs.existsSync(nmDir)?fs.statSync(nmDir).mtimeMs:0));
+  if(needInstall){
+    try{log("📦 npm install চলছে...","warn");execSync("npm install --production",{cwd:BDIR,timeout:180000});log("✅ npm install সম্পন্ন","success");}
     catch(e){log("⚠️ npm install সমস্যা: "+e.message,"error");}
   }
-  botProc=spawn("node",[idx],{cwd:BDIR,env:{...process.env,FORCE_COLOR:"1"}});
+  botProc=spawn("node",[idx],{cwd:BDIR,env:{...process.env,FORCE_COLOR:"1"},detached:false});
   botStart=Date.now(); stats.starts++; saveJ(SFILE,stats);
   log(`🟢 বট চালু (${by}) — ${idx}`,"success"); bc({type:"status",running:true});
   botProc.stdout.on("data",d=>log(d.toString().trim(),"info"));
@@ -81,10 +85,19 @@ function startBot(by="manual"){
 function stopBot(){
   if(rsTimer){clearTimeout(rsTimer);rsTimer=null;}
   if(!botProc) return {ok:false,msg:"বট চলছে না"};
-  botProc.kill("SIGTERM"); botProc=null; botStart=null;
+  try{
+    botProc.kill("SIGTERM");
+    // force kill after 5s if still running
+    setTimeout(()=>{try{if(botProc)botProc.kill("SIGKILL");}catch{}},5000);
+  }catch(e){log("⚠️ stop error: "+e.message,"error");}
+  botProc=null; botStart=null;
   log("🔴 বট বন্ধ করা হয়েছে","warn"); bc({type:"status",running:false});
   return {ok:true,msg:"বট বন্ধ হয়েছে"};
 }
+
+// ── PING (UptimeRobot এর জন্য) ──
+app.get("/ping",(req,res)=>res.json({ok:true,status:"alive",time:new Date().toISOString(),botRunning:!!botProc}));
+app.get("/health",(req,res)=>res.json({ok:true}));
 
 // ── AUTH ──
 app.get("/login",(req,res)=>{if(req.session.ok)return res.redirect("/");res.send(loginHTML());});
@@ -176,9 +189,10 @@ app.post("/api/file/upload",auth,upload.single("file"),async(req,res)=>{
       // cleanup junk
       ["__MACOSX",".DS_Store"].forEach(j=>{const jj=path.join(tmpX,j);if(fs.existsSync(jj))fs.rmSync(jj,{recursive:true,force:true});});
       // auto-flatten single root folder
-      const entries=fs.readdirSync(tmpX).filter(f=>!f.startsWith("."));
+      const entries=fs.readdirSync(tmpX);
       let src=tmpX;
-      if(entries.length===1){const s=path.join(tmpX,entries[0]);if(fs.statSync(s).isDirectory())src=s;}
+      const nonDotEntries=entries.filter(f=>!f.startsWith("."));
+      if(nonDotEntries.length===1){const s=path.join(tmpX,nonDotEntries[0]);if(fs.statSync(s).isDirectory())src=s;}
       // cross-device safe recursive copy
       function cpR(s,d){
         fs.mkdirSync(d,{recursive:true});
@@ -209,7 +223,7 @@ app.get("/api/file/search",auth,(req,res)=>{
 });
 
 // ── ENV ──
-app.get("/api/env",auth,(req,res)=>{const f=path.join(BDIR,".env");res.json({content:fs.existsSync(f)?fs.readFileSync(f,"utf8"):""});});
+app.get("/api/env",auth,(req,res)=>{const f=path.join(BDIR,".env");res.json({content:fs.existsSync(f)?fs.readFileSync(f,"utf8"):"",exists:fs.existsSync(f)});});
 app.post("/api/env/save",auth,(req,res)=>{try{fs.writeFileSync(path.join(BDIR,".env"),req.body.content||"");res.json({ok:true});}catch(e){res.json({ok:false,msg:e.message});}});
 
 // ── SETTINGS ──
@@ -495,6 +509,7 @@ textarea.cookie-input:focus{border-color:var(--ac)}
   <div class="top-logo">🤖</div>
   <div class="top-name">${pname}</div>
   <div class="top-pill"><div class="dot" id="tDot"></div><span id="tStatus">লোড...</span></div>
+  <div id="tUptime" style="font-size:10px;color:var(--mu);display:none"></div>
   <button class="top-out" onclick="location.href='/logout'">বের হন</button>
 </div>
 
@@ -508,6 +523,11 @@ textarea.cookie-input:focus{border-color:var(--ac)}
     <div class="sc"><div class="sc-i">⏱️</div><div class="sc-v" id="cSup">--</div><div class="sc-l">Server Uptime</div></div>
     <div class="sc"><div class="sc-i">📦</div><div class="sc-v" id="cFiles">--</div><div class="sc-l">বট ফাইল</div></div>
     <div class="sc"><div class="sc-i">🚀</div><div class="sc-v" id="cStarts">--</div><div class="sc-l">মোট Start</div></div>
+  </div>
+  <div class="sg" style="grid-template-columns:1fr 1fr 1fr;margin-bottom:12px">
+    <div class="sc"><div class="sc-i">💥</div><div class="sc-v" id="cCrash">--</div><div class="sc-l">Crash</div></div>
+    <div class="sc"><div class="sc-i">🕐</div><div class="sc-v" id="cTup">--</div><div class="sc-l">মোট Uptime</div></div>
+    <div class="sc"><div class="sc-i">🖥️</div><div class="sc-v" id="cNode">--</div><div class="sc-l">Node.js</div></div>
   </div>
 
   <!-- COOKIE QUICK ADD -->
@@ -580,6 +600,8 @@ textarea.cookie-input:focus{border-color:var(--ac)}
       <button class="tbtn p" onclick="showM('mkdir')">📁+</button>
       <button class="tbtn p" onclick="showM('newfile')">📄+</button>
       <button class="tbtn" onclick="loadFiles(curDir)">🔄</button>
+      <button class="tbtn" onclick="editF('package.json')" title="package.json এডিট">📋 pkg</button>
+      <button class="tbtn" onclick="editF('index.js')" title="index.js এডিট">📜 index</button>
     </div>
     <input class="sinput" type="text" id="fq" placeholder="🔍 ফাইল খোঁজুন..." oninput="doFS()">
     <div id="fsRes" style="display:none;margin-bottom:10px"></div>
@@ -714,7 +736,7 @@ function appendLog(e){
   if(autoScroll) box.scrollTop=box.scrollHeight;
 }
 
-function esc(t){return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#x27;')}
 function setLF(f,btn){logFilter=f;document.querySelectorAll(".lf").forEach(b=>b.classList.remove("on"));btn.classList.add("on");document.querySelectorAll(".le").forEach(el=>el.style.display=(f==="all"||el.dataset.t===f)?"flex":"none");}
 function clearLogs(){fetch("/api/bot/clearlogs",{method:"POST"});}
 function clearLogFile(){if(!confirm("Log file মুছবেন?"))return;fetch("/api/bot/clearlogfile",{method:"POST"}).then(r=>r.json()).then(d=>toast(d.ok?"✅ মুছা হয়েছে":"❌ ব্যর্থ",d.ok?"success":"error"));}
@@ -737,9 +759,14 @@ async function refresh(){
     document.getElementById("cSup").textContent=fmtT(st.serverUptime||0);
     document.getElementById("cFiles").textContent=st.botFiles||0;
     document.getElementById("cStarts").textContent=st.starts||0;
+    const cc=document.getElementById("cCrash");if(cc)cc.textContent=st.crashes||0;
+    const ct=document.getElementById("cTup");if(ct)ct.textContent=fmtT((st.totalUptime||0)+(bs.uptime||0));
+    const cn=document.getElementById("cNode");if(cn)cn.textContent=(st.node||"").replace("v","");
     updateStatus(bs.running);
     const sup=document.getElementById("sUp");
+    const tup=document.getElementById("tUptime");
     if(sup) sup.textContent=bs.running&&bs.uptime>0?"⏱ চলছে: "+fmtT(bs.uptime):"";
+    if(tup){if(bs.running&&bs.uptime>0){tup.textContent="⏱ "+fmtT(bs.uptime);tup.style.display="block";}else tup.style.display="none";}
     [document.getElementById("arTog"),document.getElementById("sAR")].forEach(el=>{if(el)el.checked=st.autoRestart||false;});
     const hist=(st.history||[]).slice().reverse().slice(0,8);
     const hl=document.getElementById("histList");
@@ -770,7 +797,11 @@ async function saveCookie(){
   if(!c)return toast("❌ Cookie লিখুন","error");
   const d=await fetch("/api/cookie/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cookie:c})}).then(r=>r.json());
   toast(d.ok?"✅ "+d.msg:"❌ "+d.msg,d.ok?"success":"error");
-  if(d.ok){document.getElementById("cookieInput").value="";setTimeout(()=>botAct("start"),1000);}
+  if(d.ok){
+    document.getElementById("cookieInput").value="";
+    toast("🔄 বট চালু হচ্ছে...","warn");
+    setTimeout(()=>botAct("start"),1500);
+  }
 }
 
 // FILE ICONS
@@ -860,6 +891,7 @@ function doFS(){
 }
 
 // MODALS
+document.querySelectorAll(".mbg").forEach(bg=>bg.addEventListener("click",e=>{if(e.target===bg)bg.classList.remove("open");}));
 function showM(id){document.getElementById("mod-"+id).classList.add("open");setTimeout(()=>document.querySelector("#mod-"+id+" input")?.focus(),100);}
 function closeM(id){document.getElementById("mod-"+id).classList.remove("open");}
 async function doMkdir(){const n=document.getElementById("mkN").value.trim();if(!n)return;const fp=curDir?curDir+"/"+n:n;const d=await fetch("/api/file/mkdir",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:fp})}).then(r=>r.json());closeM("mkdir");toast(d.ok?"📁 তৈরি":"❌ "+d.error,d.ok?"success":"error");if(d.ok)loadFiles(curDir);}
@@ -924,6 +956,23 @@ document.addEventListener("keydown",e=>{
   if((e.ctrlKey||e.metaKey)&&e.key==="s"&&curEdit){e.preventDefault();saveFile();}
   if(e.key==="Escape") document.querySelectorAll(".mbg.open").forEach(m=>m.classList.remove("open"));
 });
+
+// UPTIME LIVE COUNTER
+let _botUpSec=0,_botRunning=false;
+setInterval(()=>{
+  if(!_botRunning)return;
+  _botUpSec++;
+  const el=document.getElementById("sUp");
+  if(el) el.textContent="⏱ চলছে: "+fmtT(_botUpSec);
+  const tup=document.getElementById("tUptime");
+  if(tup&&tup.style.display!=="none") tup.textContent="⏱ "+fmtT(_botUpSec);
+},1000);
+const _origUpdate=updateStatus;
+// override to track state
+function updateStatus(r){
+  _botRunning=r;
+  _origUpdate(r);
+}
 
 // INIT
 connectWS();

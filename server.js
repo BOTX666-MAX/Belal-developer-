@@ -106,25 +106,42 @@ async function deleteFromMongo(relPath){
 }
 
 // Sync a directory to MongoDB recursively
-async function syncDirToMongo(dirPath, relBase){
-  if(!db_connected || !FileModel) return;
-  try {
-    const items = fs.readdirSync(dirPath);
-    for(const name of items){
-      const full = path.join(dirPath, name);
-      const rel  = relBase ? relBase+"/"+name : name;
-      const stat = fs.statSync(full);
-      if(stat.isDirectory()){
-        await saveToMongo(rel, Buffer.alloc(0), true);
-        await syncDirToMongo(full, rel);
-      } else {
-        if(stat.size < 10*1024*1024){ // 10MB limit
+// stats: {ok, fail, skipped, failedFiles} — passed by reference across recursive calls
+async function syncDirToMongo(dirPath, relBase, stats){
+  if(!db_connected || !FileModel) return stats||{ok:0,fail:0,skipped:0,failedFiles:[]};
+  if(!stats) stats={ok:0,fail:0,skipped:0,failedFiles:[]};
+  let items=[];
+  try{ items = fs.readdirSync(dirPath); }
+  catch(e){ console.log("⚠️ readdir error:", e.message); return stats; }
+
+  for(const name of items){
+    const full = path.join(dirPath, name);
+    const rel  = relBase ? relBase+"/"+name : name;
+    let stat;
+    try{ stat = fs.statSync(full); }
+    catch(e){ stats.fail++; stats.failedFiles.push(rel); continue; }
+
+    if(stat.isDirectory()){
+      try{ await saveToMongo(rel, Buffer.alloc(0), true); stats.ok++; }
+      catch(e){ stats.fail++; stats.failedFiles.push(rel); }
+      // recurse regardless — one bad folder shouldn't skip its siblings
+      await syncDirToMongo(full, rel, stats);
+    } else {
+      if(stat.size < 10*1024*1024){ // 10MB limit
+        try{
           const content = fs.readFileSync(full);
           await saveToMongo(rel, content, false);
+          stats.ok++;
+        }catch(e){
+          stats.fail++; stats.failedFiles.push(rel);
+          console.log("⚠️ sync error on "+rel+":", e.message);
         }
+      } else {
+        stats.skipped++; stats.failedFiles.push(rel+" (10MB+, skipped)");
       }
     }
-  } catch(e){ console.log("⚠️ sync error:", e.message); }
+  }
+  return stats;
 }
 
 // ── MIDDLEWARE ──
@@ -386,9 +403,14 @@ app.post("/api/file/upload",auth,upload.single("file"),async(req,res)=>{
       try{fs.rmSync(tmpX,{recursive:true,force:true});}catch{}
       // MongoDB তে sync
       const relT=path.relative(BDIR,t)||"";
-      await syncDirToMongo(t,relT);
-      log("📦 ZIP extract সম্পন্ন → "+(req.body.path||"/"),"success");
-      res.json({ok:true,msg:"ZIP extract সম্পন্ন ✅ সব ফাইল MongoDB তে সেভ হয়েছে"});
+      const syncStats=await syncDirToMongo(t,relT);
+      if(syncStats.fail>0 || syncStats.skipped>0){
+        log("⚠️ ZIP extract হয়েছে কিন্তু "+syncStats.fail+" টা ফাইল MongoDB তে সেভ ব্যর্থ, "+syncStats.skipped+" টা স্কিপ (10MB+): "+syncStats.failedFiles.join(", "),"error");
+        res.json({ok:true,msg:"⚠️ ZIP extract হয়েছে, কিন্তু "+(syncStats.fail+syncStats.skipped)+" টা ফাইল MongoDB তে সেভ হয়নি (দেখুন লগ) — restart হলে এগুলো হারিয়ে যাবে!",failedFiles:syncStats.failedFiles});
+      } else {
+        log("📦 ZIP extract সম্পন্ন → "+(req.body.path||"/")+" ("+syncStats.ok+" ফাইল)","success");
+        res.json({ok:true,msg:"ZIP extract সম্পন্ন ✅ সব "+syncStats.ok+" টা ফাইল MongoDB তে সেভ হয়েছে"});
+      }
     } else {
       // সাধারণ ফাইল
       const dst=path.join(t,req.file.originalname);

@@ -62,10 +62,48 @@ async function connectMongo(){
 
     // restore files from MongoDB on startup
     await restoreFromMongo();
+    await importRepoZipIfPresent();
   } catch(e) {
     console.log("⚠️ MongoDB connect failed:", e.message);
     db_connected = false;
     setTimeout(connectMongo, 30000);
+  }
+}
+
+// GitHub রিপোতে সরাসরি রাখা ZIP ফাইল (server.js এর পাশে) থাকলে সেটা অটো extract + MongoDB সেভ করে —
+// ফোনের ধীর নেটওয়ার্কে প্যানেল দিয়ে আপলোডের ঝামেলা এড়াতে। GitHub এর নিজস্ব আপলোড অনেক বেশি নির্ভরযোগ্য।
+// একবার import হয়ে গেলে MongoDB তে marker রাখা হয়, তাই একই zip বারবার import হবে না।
+async function importRepoZipIfPresent(){
+  try{
+    const files = fs.readdirSync(__dirname).filter(f=>f.toLowerCase().endsWith(".zip"));
+    if(files.length===0) return;
+    const zipName = files[0];
+    const zipPath = path.join(__dirname, zipName);
+    const stat = fs.statSync(zipPath);
+    const signature = zipName+":"+stat.size;
+
+    let markerDoc=null;
+    if(db_connected && FileModel){
+      markerDoc = await FileModel.findOne({path:"__zip_import_marker__"});
+    }
+    if(markerDoc && markerDoc.content && markerDoc.content.toString()===signature){
+      console.log("ℹ️ repo zip ("+zipName+") আগেই import করা হয়েছে, স্কিপ করা হলো");
+      return;
+    }
+
+    log("📦 রিপোতে নতুন ZIP পাওয়া গেছে ("+zipName+") — অটো-ইম্পোর্ট শুরু হচ্ছে...","info");
+    const result = await processUploadedFile(zipPath, zipName, "");
+    log("📦 অটো-ইম্পোর্ট ফলাফল: "+(result.body && result.body.msg),"success");
+
+    if(db_connected && FileModel){
+      await FileModel.findOneAndUpdate(
+        {path:"__zip_import_marker__"},
+        {path:"__zip_import_marker__", content:Buffer.from(signature), isDir:false, mtime:new Date(), size:signature.length},
+        {upsert:true}
+      );
+    }
+  }catch(e){
+    console.log("⚠️ auto-import zip error:", e.message);
   }
 }
 

@@ -439,7 +439,7 @@ async function processUploadedFile(filePath, originalName, reqPath){
       log("❌ ZIP ফাইল অসম্পূর্ণ/করাপ্ট — আপলোড সম্পূর্ণ হয়নি: "+e.message,"error");
       return {httpStatus:400, body:{ok:false,msg:"❌ ZIP ফাইল অসম্পূর্ণ বা করাপ্ট, আপলোড ঠিকমতো শেষ হয়নি। আবার চেষ্টা করো।"}};
     }
-    const expectedCount = zipDir.files.filter(f=>!f.path.startsWith("__MACOSX")).length;
+    let expectedCount = zipDir.files.filter(f=>!f.path.startsWith("__MACOSX")).length;
     await zipDir.extract({path:tmpX, concurrency:5});
     try{fs.unlinkSync(filePath);}catch{}
     // cleanup junk
@@ -448,7 +448,14 @@ async function processUploadedFile(filePath, originalName, reqPath){
     const entries=fs.readdirSync(tmpX);
     const nonDot=entries.filter(f=>!f.startsWith("."));
     let src=tmpX;
-    if(nonDot.length===1){const s=path.join(tmpX,nonDot[0]);if(fs.statSync(s).isDirectory())src=s;}
+    if(nonDot.length===1){
+      const s=path.join(tmpX,nonDot[0]);
+      if(fs.statSync(s).isDirectory()){
+        src=s;
+        // ফ্ল্যাটেন হলে ওই wrapper ফোল্ডারটার নিজের এন্ট্রি বাদ দিয়ে গণনা করো (তার ভেতরের জিনিস আলাদাভাবে গোনা হবে)
+        if(zipDir.files.some(f=>f.path.replace(/\/$/,"")===nonDot[0])) expectedCount--;
+      }
+    }
     // cross-device safe copy
     function cpR(s,d){
       fs.mkdirSync(d,{recursive:true});

@@ -371,56 +371,128 @@ app.get("/api/file/download",auth,(req,res)=>{
   }catch(e){res.status(500).send(e.message);}
 });
 
-// ── UPLOAD: ZIP + যেকোনো ফাইল ──
+// ── Shared processing for an uploaded file already sitting on disk ──
+// filePath: temp file location, originalName: user's filename, reqPath: target folder (relative)
+// Returns {httpStatus, body} — caller just forwards this as the JSON response.
+async function processUploadedFile(filePath, originalName, reqPath){
+  const t=safe(BDIR,reqPath||"");
+  fs.mkdirSync(t,{recursive:true});
+
+  if(originalName.endsWith(".zip")){
+    // ZIP extract — validate first so a truncated/incomplete upload fails loudly
+    // instead of silently extracting only whatever partial bytes arrived.
+    const tmpX=path.join("/tmp","xtr_"+Date.now());
+    fs.mkdirSync(tmpX,{recursive:true});
+    let zipDir;
+    try{
+      zipDir = await unzipper.Open.file(filePath); // reads central directory — throws if truncated/corrupt
+    }catch(e){
+      try{fs.unlinkSync(filePath);}catch{}
+      try{fs.rmSync(tmpX,{recursive:true,force:true});}catch{}
+      log("❌ ZIP ফাইল অসম্পূর্ণ/করাপ্ট — আপলোড সম্পূর্ণ হয়নি: "+e.message,"error");
+      return {httpStatus:400, body:{ok:false,msg:"❌ ZIP ফাইল অসম্পূর্ণ বা করাপ্ট, আপলোড ঠিকমতো শেষ হয়নি। আবার চেষ্টা করো।"}};
+    }
+    const expectedCount = zipDir.files.filter(f=>!f.path.startsWith("__MACOSX")).length;
+    await zipDir.extract({path:tmpX, concurrency:5});
+    try{fs.unlinkSync(filePath);}catch{}
+    // cleanup junk
+    ["__MACOSX",".DS_Store"].forEach(j=>{const jj=path.join(tmpX,j);if(fs.existsSync(jj))fs.rmSync(jj,{recursive:true,force:true});});
+    // auto-flatten
+    const entries=fs.readdirSync(tmpX);
+    const nonDot=entries.filter(f=>!f.startsWith("."));
+    let src=tmpX;
+    if(nonDot.length===1){const s=path.join(tmpX,nonDot[0]);if(fs.statSync(s).isDirectory())src=s;}
+    // cross-device safe copy
+    function cpR(s,d){
+      fs.mkdirSync(d,{recursive:true});
+      fs.readdirSync(s).forEach(n=>{
+        const ss=path.join(s,n),dd=path.join(d,n);
+        if(fs.statSync(ss).isDirectory()) cpR(ss,dd);
+        else fs.copyFileSync(ss,dd);
+      });
+    }
+    cpR(src,t);
+    try{fs.rmSync(tmpX,{recursive:true,force:true});}catch{}
+    // MongoDB তে sync
+    const relT=path.relative(BDIR,t)||"";
+    const syncStats=await syncDirToMongo(t,relT);
+    if(syncStats.fail>0 || syncStats.skipped>0){
+      log("⚠️ ZIP extract হয়েছে কিন্তু "+syncStats.fail+" টা ফাইল MongoDB তে সেভ ব্যর্থ, "+syncStats.skipped+" টা স্কিপ (10MB+): "+syncStats.failedFiles.join(", "),"error");
+      return {httpStatus:200, body:{ok:true,msg:"⚠️ ZIP extract হয়েছে, কিন্তু "+(syncStats.fail+syncStats.skipped)+" টা ফাইল MongoDB তে সেভ হয়নি (দেখুন লগ) — restart হলে এগুলো হারিয়ে যাবে!",failedFiles:syncStats.failedFiles}};
+    } else if(syncStats.ok < expectedCount){
+      log("⚠️ ZIP এ ছিল "+expectedCount+" টা এন্ট্রি কিন্তু extract/sync হয়েছে মাত্র "+syncStats.ok+" টা — আপলোড সম্ভবত অসম্পূর্ণ ছিল","error");
+      return {httpStatus:200, body:{ok:true,msg:"⚠️ ZIP এ ছিল "+expectedCount+" টা ফাইল/ফোল্ডার, কিন্তু মাত্র "+syncStats.ok+" টা পাওয়া গেছে। আপলোড সম্ভবত মাঝপথে কেটে গিয়েছিল — আবার আপলোড করো।"}};
+    } else {
+      log("📦 ZIP extract সম্পন্ন → "+(reqPath||"/")+" ("+syncStats.ok+" ফাইল)","success");
+      return {httpStatus:200, body:{ok:true,msg:"ZIP extract সম্পন্ন ✅ সব "+syncStats.ok+" টা ফাইল MongoDB তে সেভ হয়েছে"}};
+    }
+  } else {
+    // সাধারণ ফাইল
+    const dst=path.join(t,originalName);
+    fs.copyFileSync(filePath,dst);
+    try{fs.unlinkSync(filePath);}catch{}
+    const relPath=path.relative(BDIR,dst);
+    await saveToMongo(relPath,fs.readFileSync(dst));
+    return {httpStatus:200, body:{ok:true,msg:`✅ ${originalName} আপলোড সম্পন্ন`}};
+  }
+}
+
+// ── UPLOAD: ZIP + যেকোনো ফাইল (একবারে, ছোট ফাইল/ভালো নেটওয়ার্কের জন্য) ──
 app.post("/api/file/upload",auth,upload.single("file"),async(req,res)=>{
   try{
-    const t=safe(BDIR,req.body.path||"");
-    fs.mkdirSync(t,{recursive:true});
-
-    if(req.file.originalname.endsWith(".zip")){
-      // ZIP extract
-      const tmpX=path.join("/tmp","xtr_"+Date.now());
-      fs.mkdirSync(tmpX,{recursive:true});
-      await fs.createReadStream(req.file.path).pipe(unzipper.Extract({path:tmpX})).promise();
-      try{fs.unlinkSync(req.file.path);}catch{}
-      // cleanup junk
-      ["__MACOSX",".DS_Store"].forEach(j=>{const jj=path.join(tmpX,j);if(fs.existsSync(jj))fs.rmSync(jj,{recursive:true,force:true});});
-      // auto-flatten
-      const entries=fs.readdirSync(tmpX);
-      const nonDot=entries.filter(f=>!f.startsWith("."));
-      let src=tmpX;
-      if(nonDot.length===1){const s=path.join(tmpX,nonDot[0]);if(fs.statSync(s).isDirectory())src=s;}
-      // cross-device safe copy
-      function cpR(s,d){
-        fs.mkdirSync(d,{recursive:true});
-        fs.readdirSync(s).forEach(n=>{
-          const ss=path.join(s,n),dd=path.join(d,n);
-          if(fs.statSync(ss).isDirectory()) cpR(ss,dd);
-          else fs.copyFileSync(ss,dd);
-        });
-      }
-      cpR(src,t);
-      try{fs.rmSync(tmpX,{recursive:true,force:true});}catch{}
-      // MongoDB তে sync
-      const relT=path.relative(BDIR,t)||"";
-      const syncStats=await syncDirToMongo(t,relT);
-      if(syncStats.fail>0 || syncStats.skipped>0){
-        log("⚠️ ZIP extract হয়েছে কিন্তু "+syncStats.fail+" টা ফাইল MongoDB তে সেভ ব্যর্থ, "+syncStats.skipped+" টা স্কিপ (10MB+): "+syncStats.failedFiles.join(", "),"error");
-        res.json({ok:true,msg:"⚠️ ZIP extract হয়েছে, কিন্তু "+(syncStats.fail+syncStats.skipped)+" টা ফাইল MongoDB তে সেভ হয়নি (দেখুন লগ) — restart হলে এগুলো হারিয়ে যাবে!",failedFiles:syncStats.failedFiles});
-      } else {
-        log("📦 ZIP extract সম্পন্ন → "+(req.body.path||"/")+" ("+syncStats.ok+" ফাইল)","success");
-        res.json({ok:true,msg:"ZIP extract সম্পন্ন ✅ সব "+syncStats.ok+" টা ফাইল MongoDB তে সেভ হয়েছে"});
-      }
-    } else {
-      // সাধারণ ফাইল
-      const dst=path.join(t,req.file.originalname);
-      fs.copyFileSync(req.file.path,dst);
-      try{fs.unlinkSync(req.file.path);}catch{}
-      const relPath=path.relative(BDIR,dst);
-      await saveToMongo(relPath,fs.readFileSync(dst));
-      res.json({ok:true,msg:`✅ ${req.file.originalname} আপলোড সম্পন্ন`});
-    }
+    const result = await processUploadedFile(req.file.path, req.file.originalname, req.body.path||"");
+    res.status(result.httpStatus).json(result.body);
   }catch(e){res.status(500).json({error:e.message});}
+});
+
+// ── UPLOAD: CHUNKED (দুর্বল/অস্থির নেটওয়ার্কের জন্য — প্রতিটা ছোট টুকরা আলাদাভাবে পাঠায়, fail হলে শুধু সেই টুকরাই আবার পাঠানো যায়) ──
+const CHUNK_DIR = "/tmp/upload_chunks";
+const chunkUpload = multer({storage:multer.diskStorage({
+  destination:(r,f,cb)=>{
+    const dir=path.join(CHUNK_DIR, String(r.body.uploadId||"unknown"));
+    fs.mkdirSync(dir,{recursive:true});
+    cb(null,dir);
+  },
+  filename:(r,f,cb)=>cb(null, String(r.body.chunkIndex).padStart(6,"0"))
+}),limits:{fileSize:5*1024*1024}}); // each chunk max 5MB
+
+// আপলোড আগে থেকে কতটুকু হয়ে আছে চেক করার endpoint — resume করার জন্য
+app.get("/api/file/upload-status",auth,(req,res)=>{
+  try{
+    const uploadId=String(req.query.uploadId||"");
+    const dir=path.join(CHUNK_DIR,uploadId);
+    if(!uploadId || !fs.existsSync(dir)) return res.json({have:[]});
+    const have=fs.readdirSync(dir).map(n=>parseInt(n,10)).filter(n=>!isNaN(n));
+    res.json({have});
+  }catch(e){res.json({have:[]});}
+});
+
+app.post("/api/file/upload-chunk",auth,chunkUpload.single("chunk"),async(req,res)=>{
+  try{
+    const {uploadId,chunkIndex,totalChunks,fileName,path:reqPath}=req.body;
+    if(!uploadId||chunkIndex===undefined||!totalChunks||!fileName){
+      return res.status(400).json({ok:false,msg:"❌ চাংক তথ্য অসম্পূর্ণ"});
+    }
+    const idx=parseInt(chunkIndex,10), total=parseInt(totalChunks,10);
+    const dir=path.join(CHUNK_DIR,String(uploadId));
+    const present=fs.existsSync(dir)?fs.readdirSync(dir):[];
+    if(present.length < total){
+      // আরও চাংক বাকি আছে
+      return res.json({ok:true,chunkIndex:idx,done:false,have:present.length,need:total});
+    }
+    // সব চাংক পৌঁছে গেছে (নতুন এই চাংকসহ, অথবা আগের সেশন থেকেই resume করা) — একত্র (reassemble) করো
+    const sortedPresent=present.slice().sort();
+    const finalPath=path.join("/tmp","reassembled_"+Date.now()+"_"+fileName);
+    const ws=fs.createWriteStream(finalPath);
+    for(const chunkFile of sortedPresent){
+      const buf=fs.readFileSync(path.join(dir,chunkFile));
+      ws.write(buf);
+    }
+    await new Promise((ok,fail)=>ws.end(err=>err?fail(err):ok()));
+    try{fs.rmSync(dir,{recursive:true,force:true});}catch{}
+    const result = await processUploadedFile(finalPath, fileName, reqPath||"");
+    res.status(result.httpStatus).json({...result.body, chunkIndex:idx, done:true});
+  }catch(e){res.status(500).json({ok:false,msg:"❌ "+e.message});}
 });
 
 // Multiple files upload
@@ -1201,22 +1273,74 @@ function doFS(){
   },300);
 }
 
-// UPLOAD
+// UPLOAD — চাংক করে পাঠানো হয় (ধীর/অস্থির নেটওয়ার্কে নির্ভরযোগ্য), প্রতিটা চাংক fail করলে শুধু সেটাই রিট্রাই হয়
 async function uploadF(file){
   if(!file)return;
   const pw=document.getElementById("progWrap"),pb=document.getElementById("progBar"),pp=document.getElementById("upPct"),ps=document.getElementById("upSt"),fn=document.getElementById("upFN");
-  pw.style.display="block";fn.textContent=file.name;pb.style.width="0%";pp.textContent="0%";ps.textContent="শুরু হচ্ছে...";
-  const fd=new FormData();fd.append("file",file);fd.append("path",curDir||"");
-  const xhr=new XMLHttpRequest();xhr.open("POST","/api/file/upload");
-  xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);pb.style.width=p+"%";pp.textContent=p+"%";ps.textContent=fsz(e.loaded)+" / "+fsz(e.total);}};
-  xhr.onload=()=>{
-    const d=JSON.parse(xhr.responseText);
-    if(d.ok){pb.style.width="100%";pp.textContent="100%";ps.innerHTML='<span style="color:var(--gr)">✅ '+(d.msg||"সম্পন্ন")+'</span>';toast("✅ "+(d.msg||"সম্পন্ন"),"success");}
-    else{ps.innerHTML='<span style="color:var(--rd)">❌ '+(d.error||"ব্যর্থ")+'</span>';toast("❌ "+(d.error||"ব্যর্থ"),"error");}
-    document.getElementById("fInp").value="";
-  };
-  xhr.onerror=()=>{ps.innerHTML='<span style="color:var(--rd)">❌ নেটওয়ার্ক সমস্যা</span>';};
-  xhr.send(fd);
+  pw.style.display="block";fn.textContent=file.name;pb.style.width="0%";pp.textContent="0%";ps.textContent="চেক করা হচ্ছে (আগের অসম্পূর্ণ আপলোড আছে কিনা)...";
+  const CHUNK_SIZE=50*1024; // 50KB — ধীর নেটওয়ার্কের জন্য ছোট রাখা হয়েছে
+  const totalChunks=Math.max(1,Math.ceil(file.size/CHUNK_SIZE));
+  // ফাইলের নাম+সাইজ+lastModified থেকে স্থায়ী ID — একই ফাইল আবার সিলেক্ট করলে আগের progress থেকে resume হবে, শুরু থেকে না
+  const uploadId="f"+file.size+"_"+(file.lastModified||0)+"_"+file.name.replace(/[^a-zA-Z0-9]/g,"").slice(0,40);
+  const already=new Set();
+  try{
+    const st=await fetch("/api/file/upload-status?uploadId="+encodeURIComponent(uploadId)).then(r=>r.json());
+    (st.have||[]).forEach(i=>already.add(i));
+  }catch(e){}
+  if(already.size>0) ps.textContent="আগের আপলোড থেকে resume হচ্ছে ("+already.size+"/"+totalChunks+" আগে থেকেই আছে)...";
+
+  async function sendChunk(i){
+    const start=i*CHUNK_SIZE,end=Math.min(file.size,start+CHUNK_SIZE);
+    const blob=file.slice(start,end);
+    let attempt=0;
+    while(attempt<8){
+      try{
+        const fd=new FormData();
+        fd.append("chunk",blob,"chunk");
+        fd.append("uploadId",uploadId);
+        fd.append("chunkIndex",i);
+        fd.append("totalChunks",totalChunks);
+        fd.append("fileName",file.name);
+        fd.append("path",curDir||"");
+        const d=await fetch("/api/file/upload-chunk",{method:"POST",body:fd}).then(r=>r.json());
+        if(d && d.ok!==false)return d;
+        throw new Error(d.msg||"চাংক ব্যর্থ");
+      }catch(e){
+        attempt++;
+        ps.innerHTML='<span style="color:#f5a623">⚠️ চাংক '+(i+1)+'/'+totalChunks+' রিট্রাই ('+attempt+'/8)...</span>';
+        await new Promise(r=>setTimeout(r,Math.min(1000*attempt,8000)));
+      }
+    }
+    return null;
+  }
+
+  const toSend=[];
+  for(let i=0;i<totalChunks;i++) if(!already.has(i)) toSend.push(i);
+  let doneCount=already.size,lastResult=null,failed=false;
+  function upd(){const p=Math.round((doneCount/totalChunks)*100);pb.style.width=p+"%";pp.textContent=p+"%";}
+  upd();
+
+  for(const i of toSend){
+    const d=await sendChunk(i);
+    if(!d){
+      failed=true;
+      ps.innerHTML='<span style="color:var(--rd)">❌ চাংক '+(i+1)+' বারবার ব্যর্থ — নেটওয়ার্ক ঠিক হলে একই ফাইল আবার সিলেক্ট করলে যেখানে থেমেছিল সেখান থেকে চালিয়ে যাবে</span>';
+      toast("❌ আপলোড থেমে গেছে — নেটওয়ার্ক ঠিক হলে আবার চেষ্টা করো","error");
+      break;
+    }
+    lastResult=d;doneCount++;upd();
+    ps.textContent="চাংক "+doneCount+"/"+totalChunks+" পাঠানো হয়েছে...";
+  }
+  if(failed){document.getElementById("fInp").value="";return;}
+
+  // সব চাংক আগে থেকেই ছিল (নতুন কিছু পাঠানো লাগেনি) হলে ফাইনালাইজ করার জন্য শেষ চাংকটা আবার পাঠাও
+  if(!lastResult||!lastResult.done) lastResult=await sendChunk(totalChunks-1);
+
+  if(lastResult&&lastResult.done){
+    if(lastResult.ok){ps.innerHTML='<span style="color:var(--gr)">✅ '+(lastResult.msg||"সম্পন্ন")+'</span>';toast("✅ "+(lastResult.msg||"সম্পন্ন"),"success");}
+    else{ps.innerHTML='<span style="color:var(--rd)">❌ '+(lastResult.msg||"ব্যর্থ")+'</span>';toast("❌ "+(lastResult.msg||"ব্যর্থ"),"error");}
+  }
+  document.getElementById("fInp").value="";
 }
 
 async function uploadSingle(file){

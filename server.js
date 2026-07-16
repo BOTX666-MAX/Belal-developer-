@@ -381,7 +381,7 @@ app.post("/api/file/upload",auth,upload.single("file"),async(req,res)=>{
       // ZIP extract
       const tmpX=path.join("/tmp","xtr_"+Date.now());
       fs.mkdirSync(tmpX,{recursive:true});
-      await new Promise((ok,fail)=>fs.createReadStream(req.file.path).pipe(unzipper.Extract({path:tmpX})).on("close",ok).on("error",fail));
+      await fs.createReadStream(req.file.path).pipe(unzipper.Extract({path:tmpX})).promise();
       try{fs.unlinkSync(req.file.path);}catch{}
       // cleanup junk
       ["__MACOSX",".DS_Store"].forEach(j=>{const jj=path.join(tmpX,j);if(fs.existsSync(jj))fs.rmSync(jj,{recursive:true,force:true});});

@@ -16,6 +16,15 @@ const app    = express();
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server });
 
+// ── CRASH GUARD ── একটা রিকোয়েস্টে সমস্যা হলে যেন পুরো সার্ভার ক্র্যাশ/রিস্টার্ট না হয়ে যায়
+// (রিস্টার্ট হলে ephemeral ডিস্কের সব ফাইল + লগ হারিয়ে যায়)
+process.on("uncaughtException", (err) => {
+  console.log("⚠️ uncaughtException (সার্ভার বাঁচানো হলো):", err && err.message);
+});
+process.on("unhandledRejection", (err) => {
+  console.log("⚠️ unhandledRejection (সার্ভার বাঁচানো হলো):", err && (err.message || err));
+});
+
 // ── CONFIG ──
 const CFG   = path.join(__dirname, "panel.config.json");
 const BDIR  = path.join(__dirname, "bot");
@@ -467,6 +476,9 @@ app.get("/api/file/upload-status",auth,(req,res)=>{
   }catch(e){res.json({have:[]});}
 });
 
+// ব্যাকগ্রাউন্ড প্রসেসিং এর ফলাফল রাখার জন্য (মেমরিতে, প্রতিটা uploadId এর জন্য)
+const uploadResults = new Map();
+
 app.post("/api/file/upload-chunk",auth,chunkUpload.single("chunk"),async(req,res)=>{
   try{
     const {uploadId,chunkIndex,totalChunks,fileName,path:reqPath}=req.body;
@@ -480,7 +492,7 @@ app.post("/api/file/upload-chunk",auth,chunkUpload.single("chunk"),async(req,res
       // আরও চাংক বাকি আছে
       return res.json({ok:true,chunkIndex:idx,done:false,have:present.length,need:total});
     }
-    // সব চাংক পৌঁছে গেছে (নতুন এই চাংকসহ, অথবা আগের সেশন থেকেই resume করা) — একত্র (reassemble) করো
+    // সব চাংক পৌঁছে গেছে — একত্র (reassemble) করো, তারপর সাথে সাথেই রেসপন্স পাঠিয়ে দাও
     const sortedPresent=present.slice().sort();
     const finalPath=path.join("/tmp","reassembled_"+Date.now()+"_"+fileName);
     const ws=fs.createWriteStream(finalPath);
@@ -490,10 +502,27 @@ app.post("/api/file/upload-chunk",auth,chunkUpload.single("chunk"),async(req,res
     }
     await new Promise((ok,fail)=>ws.end(err=>err?fail(err):ok()));
     try{fs.rmSync(dir,{recursive:true,force:true});}catch{}
-    const result = await processUploadedFile(finalPath, fileName, reqPath||"");
-    res.status(result.httpStatus).json({...result.body, chunkIndex:idx, done:true});
+
+    uploadResults.set(uploadId,{status:"processing"});
+    res.json({ok:true,chunkIndex:idx,done:true,processing:true,uploadId,msg:"📦 ফাইল পৌঁছেছে, এখন extract + সেভ হচ্ছে (ব্যাকগ্রাউন্ডে)..."});
+
+    // ভারী কাজ (extract + MongoDB sync) request থেকে আলাদা করে ব্যাকগ্রাউন্ডে — যাতে সময় বেশি লাগলেও
+    // HTTP request/connection timeout হয়ে সার্ভার ক্র্যাশ না করে
+    processUploadedFile(finalPath, fileName, reqPath||"")
+      .then(result=>{ uploadResults.set(uploadId,{status:"done",...result.body}); })
+      .catch(e=>{ uploadResults.set(uploadId,{status:"done",ok:false,msg:"❌ "+e.message}); });
   }catch(e){res.status(500).json({ok:false,msg:"❌ "+e.message});}
 });
+
+// ব্যাকগ্রাউন্ড প্রসেসিং শেষ হয়েছে কিনা চেক করার জন্য — ক্লায়েন্ট এটা পোল করবে
+app.get("/api/file/upload-result",auth,(req,res)=>{
+  const uploadId=String(req.query.uploadId||"");
+  const r=uploadResults.get(uploadId);
+  if(!r) return res.json({status:"unknown"});
+  res.json(r);
+  if(r.status==="done") uploadResults.delete(uploadId); // একবার দেখানোর পর মুছে ফেলা
+});
+
 
 // Multiple files upload
 app.post("/api/file/upload-multi",auth,upload.array("files",50),async(req,res)=>{
@@ -1336,7 +1365,24 @@ async function uploadF(file){
   // সব চাংক আগে থেকেই ছিল (নতুন কিছু পাঠানো লাগেনি) হলে ফাইনালাইজ করার জন্য শেষ চাংকটা আবার পাঠাও
   if(!lastResult||!lastResult.done) lastResult=await sendChunk(totalChunks-1);
 
-  if(lastResult&&lastResult.done){
+  if(lastResult&&lastResult.done&&lastResult.processing){
+    // extract+সেভ ব্যাকগ্রাউন্ডে চলছে — শেষ না হওয়া পর্যন্ত পোল করো (রিকোয়েস্ট টাইমআউট এড়াতে)
+    ps.innerHTML='<span style="color:#f5a623">⏳ '+(lastResult.msg||"প্রসেস হচ্ছে...")+'</span>';
+    let final=null;
+    for(let tries=0;tries<150;tries++){ // সর্বোচ্চ ~৭.৫ মিনিট (150 x 3s)
+      await new Promise(r=>setTimeout(r,3000));
+      try{
+        const st=await fetch("/api/file/upload-result?uploadId="+encodeURIComponent(uploadId)).then(r=>r.json());
+        if(st.status==="done"){final=st;break;}
+      }catch(e){}
+    }
+    if(final){
+      if(final.ok){ps.innerHTML='<span style="color:var(--gr)">✅ '+(final.msg||"সম্পন্ন")+'</span>';toast("✅ "+(final.msg||"সম্পন্ন"),"success");}
+      else{ps.innerHTML='<span style="color:var(--rd)">❌ '+(final.msg||"ব্যর্থ")+'</span>';toast("❌ "+(final.msg||"ব্যর্থ"),"error");}
+    }else{
+      ps.innerHTML='<span style="color:var(--rd)">⚠️ অনেকক্ষণ হয়ে গেছে, ফলাফল জানা যায়নি — "লগ" বা "ফাইল" ট্যাবে গিয়ে সরাসরি চেক করো</span>';
+    }
+  } else if(lastResult&&lastResult.done){
     if(lastResult.ok){ps.innerHTML='<span style="color:var(--gr)">✅ '+(lastResult.msg||"সম্পন্ন")+'</span>';toast("✅ "+(lastResult.msg||"সম্পন্ন"),"success");}
     else{ps.innerHTML='<span style="color:var(--rd)">❌ '+(lastResult.msg||"ব্যর্থ")+'</span>';toast("❌ "+(lastResult.msg||"ব্যর্থ"),"error");}
   }

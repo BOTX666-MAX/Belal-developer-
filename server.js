@@ -201,7 +201,7 @@ const auth = (req,res,next) => req.session.ok ? next() : res.redirect("/login");
 const safe = (base,rel) => { const f=path.resolve(base,rel||""); if(!f.startsWith(path.resolve(base))) throw new Error("Access denied"); return f; };
 
 // ── BOT ──
-let botProc=null, botLogs=[], botStart=null, autoRestart=cfg.autoRestart||false, rsTimer=null;
+let botProc=null, botLogs=[], botStart=null, autoRestart=cfg.autoRestart||false, rsTimer=null, _consecutiveCrashes=0;
 
 function bc(d){wss.clients.forEach(c=>{if(c.readyState===WebSocket.OPEN)c.send(JSON.stringify(d));});}
 
@@ -237,7 +237,17 @@ function startBot(by="manual"){
     saveJ(SFILE,stats);
     log(`🔴 বট বন্ধ (code:${code||sig}, uptime:${fmtS(up)})`,"error");
     botProc=null; botStart=null; bc({type:"status",running:false});
-    if(autoRestart&&code!==0&&code!==null){log("🔄 Auto-restart ১০ সেকেন্ড পরে...","warn");rsTimer=setTimeout(()=>startBot("auto-restart"),10000);}
+    if(autoRestart&&code!==0&&code!==null){
+      // ── উঠতি-ধাপে অপেক্ষা (exponential backoff) ──
+      // দ্রুত/বারবার ক্র্যাশ হলে (বিশেষত ফেসবুকের 429 rate-limit) প্রতিবার
+      // অপেক্ষার সময় বাড়বে, যাতে ফেসবুককে বারবার বিরক্ত করে ব্লক আরও
+      // দীর্ঘায়িত না করি। বট মোটামুটি স্থিতিশীলভাবে (২ মিনিট+) চললে
+      // কাউন্টার রিসেট হয়ে যাবে।
+      if(up>=120) _consecutiveCrashes=0; else _consecutiveCrashes++;
+      const waitSec=Math.min(10*Math.pow(2,_consecutiveCrashes),300); // ১০সে থেকে সর্বোচ্চ ৫মিনিট
+      log(`🔄 Auto-restart ${waitSec} সেকেন্ড পরে... (পরপর ${_consecutiveCrashes} বার ক্র্যাশ)`,"warn");
+      rsTimer=setTimeout(()=>startBot("auto-restart"),waitSec*1000);
+    }
   });
   return {ok:true,msg:"বট চালু হয়েছে"};
 }
@@ -717,7 +727,7 @@ input:focus{border-color:#6c63ff;background:rgba(108,99,255,.1)}
 </style></head><body>
 <div class="bg"><div class="orb o1"></div><div class="orb o2"></div><div class="orb o3"></div></div>
 <div class="card">
-  <div class="logo">🤖</div>
+  <div class="logo"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="width:28px;height:28px"><rect x="4" y="8" width="16" height="12" rx="3" fill="#fff" fill-opacity=".95"/><circle cx="9" cy="14" r="1.6" fill="#6C63FF"/><circle cx="15" cy="14" r="1.6" fill="#6C63FF"/><rect x="10.2" y="17" width="3.6" height="1.3" rx=".65" fill="#6C63FF"/><line x1="12" y1="4" x2="12" y2="8" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/><circle cx="12" cy="3.2" r="1.5" fill="#fff"/><rect x="1.8" y="12" width="2" height="4" rx="1" fill="#fff" fill-opacity=".8"/><rect x="20.2" y="12" width="2" height="4" rx="1" fill="#fff" fill-opacity=".8"/></svg></div>
   <h1>Bot Panel</h1>
   <p class="sub">তোমার বট কন্ট্রোল সেন্টার</p>
   <div class="err" id="err"></div>
@@ -746,7 +756,13 @@ return `<!DOCTYPE html><html lang="bn"><head>
 :root{--bg:#07070e;--s1:#0d0d18;--s2:#141424;--s3:#1a1a2e;--bd:#232338;--tx:#dde0f0;--mu:#5a5a80;--ac:#6c63ff;--gr:#3ecf8e;--rd:#f05252;--yw:#f0b429;--bl:#38bdf8;--or:#fb923c}
 body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
 .top{position:fixed;top:0;left:0;right:0;height:54px;background:rgba(13,13,24,.97);backdrop-filter:blur(20px);border-bottom:1px solid var(--bd);display:flex;align-items:center;padding:0 14px;z-index:200;gap:10px}
-.top-logo{width:34px;height:34px;background:linear-gradient(135deg,var(--ac),#ff6584);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;box-shadow:0 0 20px rgba(108,99,255,.4)}
+.top-logo{width:34px;height:34px;background:linear-gradient(135deg,var(--ac),#ff6584);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;box-shadow:0 0 20px rgba(108,99,255,.4);transition:box-shadow .4s}
+.top-logo svg{width:20px;height:20px;filter:drop-shadow(0 0 2px rgba(255,255,255,.4))}
+.top-logo.live{animation:logoPulse 1.8s ease-in-out infinite}
+@keyframes logoPulse{
+  0%,100%{box-shadow:0 0 20px rgba(108,99,255,.4),0 0 0 0 rgba(46,213,115,.5)}
+  50%{box-shadow:0 0 28px rgba(108,99,255,.7),0 0 0 8px rgba(46,213,115,0)}
+}
 .top-name{font-size:15px;font-weight:800;color:#fff;flex:1}
 .top-pills{display:flex;align-items:center;gap:6px}
 .top-pill{display:flex;align-items:center;gap:5px;background:var(--s2);border:1px solid var(--bd);border-radius:99px;padding:4px 10px;font-size:11px}
@@ -881,7 +897,7 @@ textarea.ci:focus{border-color:var(--ac)}
 </style></head><body>
 
 <div class="top">
-  <div class="top-logo">🤖</div>
+  <div class="top-logo" id="topLogo"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="8" width="16" height="12" rx="3" fill="#fff" fill-opacity=".95"/><circle cx="9" cy="14" r="1.6" fill="#6C63FF"/><circle cx="15" cy="14" r="1.6" fill="#6C63FF"/><rect x="10.2" y="17" width="3.6" height="1.3" rx=".65" fill="#6C63FF"/><line x1="12" y1="4" x2="12" y2="8" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/><circle cx="12" cy="3.2" r="1.5" fill="#fff"/><rect x="1.8" y="12" width="2" height="4" rx="1" fill="#fff" fill-opacity=".8"/><rect x="20.2" y="12" width="2" height="4" rx="1" fill="#fff" fill-opacity=".8"/></svg></div>
   <div class="top-name">${pname}</div>
   <div class="top-pills">
     <div class="top-pill"><div class="dot" id="tDot"></div><span id="tStatus">লোড...</span></div>
@@ -1157,6 +1173,7 @@ function updateStatus(running){
   _botRunning=running;
   if(!running) _botUpSec=0;
   [document.getElementById("sDot"),document.getElementById("tDot")].forEach(d=>{if(d)d.className="dot"+(running?" on":"");});
+  const tLogo=document.getElementById("topLogo");if(tLogo)tLogo.className="top-logo"+(running?" live":"");
   const st=document.getElementById("sTxt");if(st)st.textContent=running?"✅ বট চলছে":"🔴 বট বন্ধ";
   const ts=document.getElementById("tStatus");if(ts)ts.textContent=running?"✅ চলছে":"🔴 বন্ধ";
 }
@@ -1172,7 +1189,33 @@ function updateMongo(connected){
 
 function fmtT(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sc=s%60;return h>0?h+"h "+m+"m":m>0?m+"m "+sc+"s":sc+"s";}
 function fsz(b){if(!b||b===0)return"—";if(b<1024)return b+"B";if(b<1048576)return(b/1024).toFixed(1)+"KB";return(b/1048576).toFixed(1)+"MB";}
-function fdt(d){try{return new Date(d).toLocaleDateString("bn-BD",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});}catch{return"";}}
+function fdt(d){
+  try{
+    const then=new Date(d).getTime(), now=Date.now();
+    const diffSec=Math.floor((now-then)/1000);
+    if(diffSec<0||isNaN(diffSec)) return new Date(d).toLocaleDateString("bn-BD",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+    if(diffSec<10) return "এইমাত্র";
+    if(diffSec<60) return diffSec+" সেকেন্ড আগে";
+    const diffMin=Math.floor(diffSec/60);
+    if(diffMin<60) return diffMin+" মিনিট আগে";
+    const diffHr=Math.floor(diffMin/60);
+    if(diffHr<24) return diffHr+" ঘণ্টা আগে";
+    const diffDay=Math.floor(diffHr/24);
+    if(diffDay===1) return "গতকাল";
+    if(diffDay<7) return diffDay+" দিন আগে";
+    if(diffDay<30) return Math.floor(diffDay/7)+" সপ্তাহ আগে";
+    // পুরনো হলে সরাসরি তারিখ দেখাও
+    return new Date(d).toLocaleDateString("bn-BD",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+  }catch{return"";}
+}
+// প্রতি ৩০ সেকেন্ডে ফাইল লিস্টের সময়গুলো লাইভ রিফ্রেশ করো (GitHub-এর মতো)
+// — data-mtime attribute থেকে আবার হিসাব করে টেক্সট আপডেট করে, পুরো লিস্ট আবার লোড করে না
+setInterval(()=>{
+  document.querySelectorAll("[data-mtime]").forEach(el=>{
+    const m=el.getAttribute("data-mtime");
+    if(m) el.textContent=fdt(m);
+  });
+},30000);
 
 // Live uptime counter
 setInterval(()=>{if(!_botRunning)return;_botUpSec++;const el=document.getElementById("sUp");if(el)el.textContent="⏱ চলছে: "+fmtT(_botUpSec);},1000);
@@ -1262,7 +1305,7 @@ async function loadFiles(dir){
     const fp=curDir?curDir+"/"+item.name:item.name;
     const row=document.createElement("div");row.className="frow";
     row.innerHTML='<span class="fi">'+ficon(item.name,item.isDir)+'</span>'
-      +'<div class="fn"><div class="fn-name">'+item.name+'</div><div class="fn-meta">'+fsz(item.size)+(item.mtime?" · "+fdt(item.mtime):"")+'</div></div>'
+      +'<div class="fn"><div class="fn-name">'+item.name+'</div><div class="fn-meta">'+fsz(item.size)+(item.mtime?' · <span data-mtime="'+item.mtime+'">'+fdt(item.mtime)+'</span>':"")+'</div></div>'
       +'<div class="fa">'
       +(item.isDir?'':'<button class="fab" onclick="event.stopPropagation();editF(\\''+fp+'\\')">✏️</button>')
       +'<button class="fab" onclick="event.stopPropagation();dlF(\\''+fp+'\\')">⬇️</button>'

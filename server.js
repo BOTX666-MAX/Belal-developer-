@@ -63,6 +63,25 @@ async function connectMongo(){
     // restore files from MongoDB on startup
     await restoreFromMongo();
     await importRepoZipIfPresent();
+
+    // ── আগে বট চালু ছিল কিনা চেক করে, থাকলে নিজে থেকেই আবার চালু করা ──
+    // (পুরো container restart হয়ে গেলে এটাই একমাত্র উপায় যেটা বট
+    // নিজে থেকে আবার চালু করতে পারে, "Auto Restart" টগল শুধু in-process
+    // ক্র্যাশের জন্য কাজ করে, পুরো restart-এর জন্য না)
+    setTimeout(async()=>{
+      try{
+        const shouldRun=await getShouldRun();
+        const asPath=path.join(BDIR,"appstate.json");
+        let hasValidCookie=false;
+        if(fs.existsSync(asPath)){
+          try{const arr=JSON.parse(fs.readFileSync(asPath,"utf8"));hasValidCookie=Array.isArray(arr)&&arr.length>0;}catch{}
+        }
+        if(shouldRun && hasValidCookie){
+          log("🔄 আগে বট চালু ছিল — নিজে থেকেই আবার চালু করা হচ্ছে...","warn");
+          startBot("auto-boot");
+        }
+      }catch(e){console.log("⚠️ auto-boot check error:",e.message);}
+    },8000); // ফাইল restore + npm install এর জন্য একটু সময় দেওয়া হলো
   } catch(e) {
     console.log("⚠️ MongoDB connect failed:", e.message);
     db_connected = false;
@@ -214,6 +233,26 @@ function log(text,type="info"){
 
 function fmtS(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sc=s%60;return h>0?h+"h "+m+"m":m>0?m+"m "+sc+"s":sc+"s";}
 
+// ── বট "চালু থাকার কথা ছিল কিনা" MongoDB তে মনে রাখা — যাতে পুরো container
+// restart হয়ে গেলেও বট নিজে থেকেই আবার চালু হতে পারে, শুধু ক্র্যাশ না
+async function setShouldRun(val){
+  try{
+    if(!db_connected||!FileModel) return;
+    await FileModel.findOneAndUpdate(
+      {path:"__bot_should_run__"},
+      {path:"__bot_should_run__", content:Buffer.from(val?"1":"0"), isDir:false, mtime:new Date(), size:1},
+      {upsert:true}
+    );
+  }catch(e){console.log("⚠️ setShouldRun error:",e.message);}
+}
+async function getShouldRun(){
+  try{
+    if(!db_connected||!FileModel) return false;
+    const doc=await FileModel.findOne({path:"__bot_should_run__"});
+    return !!(doc && doc.content && doc.content.toString()==="1");
+  }catch{return false;}
+}
+
 function startBot(by="manual"){
   if(botProc) return {ok:false,msg:"বট ইতিমধ্যে চলছে"};
   const idx=["index.js","app.js","main.js","bot.js","start.js"].find(f=>fs.existsSync(path.join(BDIR,f)));
@@ -226,6 +265,7 @@ function startBot(by="manual"){
   }
   botProc=spawn("node",[idx],{cwd:BDIR,env:{...process.env,FORCE_COLOR:"1"}});
   botStart=Date.now(); stats.starts++; saveJ(SFILE,stats);
+  setShouldRun(true);
   log(`🟢 বট চালু (${by}) — ${idx}`,"success"); bc({type:"status",running:true});
   const NOISY=[/Warning: Accessing non-existent property/i,/circular dependency/i,/--trace-warnings/i,/\[DEP\d+\]/i,/is deprecated\. Please use/i];
   const isNoisy=s=>NOISY.some(rx=>rx.test(s));
@@ -261,6 +301,7 @@ function stopBot(){
   if(!botProc) return {ok:false,msg:"বট চলছে না"};
   try{botProc.kill("SIGTERM");setTimeout(()=>{try{if(botProc)botProc.kill("SIGKILL");}catch{}},5000);}catch{}
   botProc=null; botStart=null;
+  setShouldRun(false);
   log("🔴 বট বন্ধ করা হয়েছে","warn"); bc({type:"status",running:false});
   return {ok:true,msg:"বট বন্ধ হয়েছে"};
 }

@@ -227,8 +227,10 @@ function startBot(by="manual"){
   botProc=spawn("node",[idx],{cwd:BDIR,env:{...process.env,FORCE_COLOR:"1"}});
   botStart=Date.now(); stats.starts++; saveJ(SFILE,stats);
   log(`🟢 বট চালু (${by}) — ${idx}`,"success"); bc({type:"status",running:true});
-  botProc.stdout.on("data",d=>log(d.toString().trim(),"info"));
-  botProc.stderr.on("data",d=>log(d.toString().trim(),"error"));
+  const NOISY=[/Warning: Accessing non-existent property/i,/circular dependency/i,/--trace-warnings/i,/\[DEP\d+\]/i,/is deprecated\. Please use/i];
+  const isNoisy=s=>NOISY.some(rx=>rx.test(s));
+  botProc.stdout.on("data",d=>{const s=d.toString().trim();if(s&&!isNoisy(s))log(s,"info");});
+  botProc.stderr.on("data",d=>{const s=d.toString().trim();if(s&&!isNoisy(s))log(s,"error");});
   botProc.on("exit",(code,sig)=>{
     const up=botStart?Math.floor((Date.now()-botStart)/1000):0;
     stats.totalUptime+=up; stats.history.push({date:new Date().toISOString(),uptime:up,code:code||sig});
@@ -829,7 +831,7 @@ textarea.ci:focus{border-color:var(--ac)}
 .lbox::-webkit-scrollbar-thumb{background:var(--bd);border-radius:2px}
 .le{display:flex;gap:5px;padding:2px 0;line-height:1.6}
 .lt{color:var(--mu);white-space:nowrap;font-size:10px;flex-shrink:0}
-.lx{word-break:break-all}
+.lx{word-break:normal;overflow-wrap:anywhere;line-height:1.55}
 .li .lx{color:#9ca3af}.ls .lx{color:var(--gr)}.lr .lx{color:var(--rd)}.lw .lx{color:var(--yw)}
 .pathbar{background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:8px 12px;font-size:12px;color:var(--mu);margin-bottom:10px;overflow-x:auto;white-space:nowrap;display:flex;align-items:center;gap:4px}
 .pathbar::-webkit-scrollbar{display:none}

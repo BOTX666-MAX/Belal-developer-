@@ -229,8 +229,10 @@ function startBot(by="manual"){
   log(`🟢 বট চালু (${by}) — ${idx}`,"success"); bc({type:"status",running:true});
   const NOISY=[/Warning: Accessing non-existent property/i,/circular dependency/i,/--trace-warnings/i,/\[DEP\d+\]/i,/is deprecated\. Please use/i];
   const isNoisy=s=>NOISY.some(rx=>rx.test(s));
-  botProc.stdout.on("data",d=>{const s=d.toString().trim();if(s&&!isNoisy(s))log(s,"info");});
-  botProc.stderr.on("data",d=>{const s=d.toString().trim();if(s&&!isNoisy(s))log(s,"error");});
+  // eslint-disable-next-line no-control-regex
+  const stripAnsi=s=>s.replace(/\x1B\[[0-9;]*[a-zA-Z]/g,"");
+  botProc.stdout.on("data",d=>{const s=stripAnsi(d.toString()).trim();if(s&&!isNoisy(s))log(s,"info");});
+  botProc.stderr.on("data",d=>{const s=stripAnsi(d.toString()).trim();if(s&&!isNoisy(s))log(s,"error");});
   botProc.on("exit",(code,sig)=>{
     const up=botStart?Math.floor((Date.now()-botStart)/1000):0;
     stats.totalUptime+=up; stats.history.push({date:new Date().toISOString(),uptime:up,code:code||sig});

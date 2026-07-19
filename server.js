@@ -637,6 +637,17 @@ app.post("/api/env/save",auth,async(req,res)=>{
 });
 
 // ── COOKIE ──
+app.get("/api/cookie/status",auth,(req,res)=>{
+  try{
+    const p=path.join(BDIR,"appstate.json");
+    if(!fs.existsSync(p)) return res.json({saved:false});
+    const content=fs.readFileSync(p,"utf8").trim();
+    let arr; try{arr=JSON.parse(content);}catch{arr=null;}
+    const saved = Array.isArray(arr) && arr.length>0;
+    res.json({saved});
+  }catch(e){res.json({saved:false});}
+});
+
 app.post("/api/cookie/save",auth,async(req,res)=>{
   try{
     const cookie=req.body.cookie||"";
@@ -930,6 +941,7 @@ textarea.ci:focus{border-color:var(--ac)}
   <div class="cookie-box">
     <div style="font-size:13px;font-weight:700;margin-bottom:4px">🍪 Facebook Cookie / Appstate</div>
     <div style="font-size:11px;color:var(--mu)">Cookie বা appstate.json paste করুন → বট চালু</div>
+    <div id="cookieStatus" style="font-size:12px;margin:6px 0;padding:6px 10px;border-radius:8px;display:none"></div>
     <textarea class="ci" id="cookieInput" placeholder='[{"key":"c_user","value":"..."}] অথবা plain cookie string'></textarea>
     <button class="btn b-start" onclick="saveCookie()">✅ Cookie সেভ ও বট চালু করুন</button>
   </div>
@@ -1236,6 +1248,11 @@ async function refresh(){
     const cn=document.getElementById("cNode");if(cn)cn.textContent=(st.node||"").replace("v","");
     updateStatus(bs.running);
     updateMongo(st.mongoConnected||false);
+    fetch("/api/cookie/status").then(r=>r.json()).then(cs=>{
+      const el=document.getElementById("cookieStatus");if(!el)return;
+      if(cs.saved){el.style.display="block";el.style.background="rgba(46,213,115,.12)";el.style.color="var(--gr)";el.textContent="✅ Cookie ইতিমধ্যে সেভ করা আছে — নতুন করে না বসালেও চলবে";}
+      else{el.style.display="block";el.style.background="rgba(240,82,82,.12)";el.style.color="var(--rd)";el.textContent="⚠️ এখনো কোনো Cookie সেভ নেই";}
+    }).catch(()=>{});
     if(bs.running&&bs.uptime>0&&_botUpSec===0) _botUpSec=bs.uptime;
     [document.getElementById("arTog"),document.getElementById("sAR")].forEach(el=>{if(el)el.checked=st.autoRestart||false;});
     const hist=(st.history||[]).slice().reverse().slice(0,8);

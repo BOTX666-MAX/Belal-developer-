@@ -30,14 +30,43 @@ const CFG   = path.join(__dirname, "panel.config.json");
 const BDIR  = path.join(__dirname, "bot");
 const LFILE = path.join(__dirname, "panel.log");
 const SFILE = path.join(__dirname, "stats.json");
+const LTFILE = path.join(__dirname, "lifetime.json"); // panel/bot RAM + mongo ব্যবহারের সর্বকালীন উচ্চতম (lifetime peak) — MongoDB-তেও ব্যাকআপ থাকে, তাই panel restart হলেও হারায় না
 const PORT  = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGODB_URI || "mongodb+srv://belal:belal123456@cluster0.i1wofni.mongodb.net/botpanel?appName=Cluster0";
 
 function loadJ(f,def={}){try{return JSON.parse(fs.readFileSync(f,"utf8"));}catch{return def;}}
 function saveJ(f,d){try{fs.writeFileSync(f,JSON.stringify(d,null,2));}catch{}}
 
+// panel.config.json শুধু লোকাল ডিস্কে (ephemeral) থাকলে container restart এ হারিয়ে
+// যায় (Auto Restart টগল, পাসওয়ার্ড ইত্যাদি সব রিসেট হয়ে যায়) — তাই MongoDB তেও
+// একটা কপি রাখা হয়, boot এর সময় সেখান থেকে ফিরিয়ে আনা হয়
+function saveCfg(){
+  saveJ(CFG,cfg);
+  if(db_connected && FileModel){
+    FileModel.findOneAndUpdate(
+      {path:"__panel_config__"},
+      {path:"__panel_config__", content:Buffer.from(JSON.stringify(cfg)), isDir:false, mtime:new Date(), size:JSON.stringify(cfg).length},
+      {upsert:true}
+    ).catch(e=>console.log("⚠️ saveCfg mongo error:",e.message));
+  }
+}
+async function loadCfgFromMongo(){
+  try{
+    if(!db_connected||!FileModel) return;
+    const doc=await FileModel.findOne({path:"__panel_config__"});
+    if(doc && doc.content){
+      const saved=JSON.parse(doc.content.toString());
+      Object.assign(cfg, saved);
+      if(cfg.autoRestart!==undefined) autoRestart=!!cfg.autoRestart;
+      saveJ(CFG,cfg);
+      console.log("✅ প্যানেল সেটিংস MongoDB থেকে ফিরিয়ে আনা হয়েছে (Auto Restart:", autoRestart, ")");
+    }
+  }catch(e){console.log("⚠️ loadCfgFromMongo error:",e.message);}
+}
+
 let cfg   = loadJ(CFG);
 let stats = loadJ(SFILE,{starts:0,crashes:0,totalUptime:0,history:[],loginAttempts:{}});
+let lifetime = loadJ(LTFILE,{peakPanelMB:0,peakBotMB:0,peakMongoMB:0,firstSeen:new Date().toISOString()});
 const PASS = process.env.PANEL_PASSWORD || cfg.password || "admin123";
 if(!fs.existsSync(BDIR)) fs.mkdirSync(BDIR,{recursive:true});
 
@@ -60,7 +89,11 @@ async function connectMongo(){
     });
     FileModel = mongoose.models.BotFile || mongoose.model("BotFile", fileSchema);
 
+    // প্যানেল সেটিংস (Auto Restart টগল ইত্যাদি) MongoDB থেকে ফিরিয়ে আনা
+    await loadCfgFromMongo();
+
     // restore files from MongoDB on startup
+    await restorePanelPersistent();
     await restoreFromMongo();
     await importRepoZipIfPresent();
 
@@ -171,6 +204,29 @@ async function deleteFromMongo(relPath){
   } catch(e){ console.log("⚠️ mongo delete error:", e.message); }
 }
 
+// ── প্যানেলের নিজস্ব stats.json ও lifetime.json MongoDB-তে ব্যাকআপ/রিস্টোর ──
+// (Render-এর ডিস্ক ephemeral, তাই এগুলো শুধু ডিস্কে রাখলে প্যানেল restart হলেই "লাইফটাইম" হিসাব শূন্য হয়ে যেত)
+async function savePanelStatsToMongo(){ await saveToMongo("__panel_stats__", JSON.stringify(stats), false); }
+async function saveLifetimeToMongo(){ await saveToMongo("__panel_lifetime__", JSON.stringify(lifetime), false); }
+async function restorePanelPersistent(){
+  if(!db_connected || !FileModel) return;
+  try{
+    const s = await FileModel.findOne({path:"__panel_stats__"});
+    if(s && s.content){ try{ stats = {...stats, ...JSON.parse(s.content.toString())}; saveJ(SFILE,stats); }catch{} }
+    const l = await FileModel.findOne({path:"__panel_lifetime__"});
+    if(l && l.content){ try{ lifetime = {...lifetime, ...JSON.parse(l.content.toString())}; saveJ(LTFILE,lifetime); }catch{} }
+    console.log("✅ প্যানেলের লাইফটাইম স্ট্যাটস MongoDB থেকে restore হয়েছে");
+  }catch(e){ console.log("⚠️ panel stats restore error:", e.message); }
+}
+function bumpLifetimePeak(key, valueMB){
+  if(valueMB==null) return;
+  if(valueMB > (lifetime[key]||0)){
+    lifetime[key] = valueMB;
+    saveJ(LTFILE, lifetime);
+    saveLifetimeToMongo(); // fire-and-forget — নতুন রেকর্ড হলেই সাথে সাথে ব্যাকআপ
+  }
+}
+
 // Sync a directory to MongoDB recursively
 // stats: {ok, fail, skipped, failedFiles} — passed by reference across recursive calls
 async function syncDirToMongo(dirPath, relBase, stats){
@@ -264,7 +320,7 @@ function startBot(by="manual"){
     catch(e){log("⚠️ npm install সমস্যা: "+e.message,"error");}
   }
   botProc=spawn("node",[idx],{cwd:BDIR,env:{...process.env,FORCE_COLOR:"1"}});
-  botStart=Date.now(); stats.starts++; saveJ(SFILE,stats);
+  botStart=Date.now(); stats.starts++; saveJ(SFILE,stats); savePanelStatsToMongo();
   setShouldRun(true);
   log(`🟢 বট চালু (${by}) — ${idx}`,"success"); bc({type:"status",running:true});
   const NOISY=[/Warning: Accessing non-existent property/i,/circular dependency/i,/--trace-warnings/i,/\[DEP\d+\]/i,/is deprecated\. Please use/i];
@@ -277,8 +333,15 @@ function startBot(by="manual"){
     const up=botStart?Math.floor((Date.now()-botStart)/1000):0;
     stats.totalUptime+=up; stats.history.push({date:new Date().toISOString(),uptime:up,code:code||sig});
     if(stats.history.length>100) stats.history.shift();
-    if(code!==0&&code!==null) stats.crashes++;
-    saveJ(SFILE,stats);
+    if(code!==0&&code!==null){
+      stats.crashes++;
+      try{
+        fs.writeFileSync(path.join(BDIR,".crash_flag.json"), JSON.stringify({
+          time: new Date().toISOString(), code: code||sig, uptimeSec: up
+        }));
+      }catch{}
+    }
+    saveJ(SFILE,stats); savePanelStatsToMongo();
     log(`🔴 বট বন্ধ (code:${code||sig}, uptime:${fmtS(up)})`,"error");
     botProc=null; botStart=null; bc({type:"status",running:false});
     if(autoRestart&&code!==0&&code!==null){
@@ -350,7 +413,7 @@ app.post("/api/bot/install", auth,(req,res)=>{
   try{log("📦 npm install চলছে...","warn");execSync("npm install",{cwd:BDIR,timeout:180000});log("✅ সম্পন্ন","success");res.json({ok:true,msg:"npm install সম্পন্ন"});}
   catch(e){log("❌ npm install ব্যর্থ: "+e.message,"error");res.json({ok:false,msg:e.message});}
 });
-app.post("/api/bot/autorestart",auth,(req,res)=>{autoRestart=!!req.body.enabled;cfg.autoRestart=autoRestart;saveJ(CFG,cfg);res.json({ok:true,enabled:autoRestart});});
+app.post("/api/bot/autorestart",auth,(req,res)=>{autoRestart=!!req.body.enabled;cfg.autoRestart=autoRestart;saveCfg();res.json({ok:true,enabled:autoRestart});});
 app.get("/api/bot/downloadlog",auth,(req,res)=>{if(fs.existsSync(LFILE))res.download(LFILE,"bot.log");else res.status(404).send("No log");});
 app.post("/api/bot/clearlogfile",auth,(req,res)=>{try{fs.writeFileSync(LFILE,"");res.json({ok:true});}catch(e){res.json({ok:false,msg:e.message});}});
 
@@ -361,6 +424,85 @@ app.get("/api/stats",auth,(req,res)=>{
     serverUptime:Math.floor(process.uptime()),node:process.version,
     botFiles:countF(BDIR),mongoConnected:db_connected});
 });
+
+// ── লাইভ সিস্টেম মনিটর — RAM (panel+bot) + MongoDB storage + Render bandwidth (optional API key) ──
+function getBotMemMB(){
+  if(!botProc || !botProc.pid) return null;
+  try{
+    const status = fs.readFileSync("/proc/"+botProc.pid+"/status","utf8");
+    const m = status.match(/VmRSS:\s+(\d+)\s+kB/);
+    return m ? Math.round(parseInt(m[1],10)/1024) : null;
+  }catch{ return null; } // /proc না থাকলে (নন-লিনাক্স) বা প্রসেস শেষ হয়ে গেলে
+}
+let _renderCache = {data:null, at:0};
+async function getRenderBandwidth(){
+  const key = process.env.RENDER_API_KEY, svc = process.env.RENDER_SERVICE_ID;
+  if(!key || !svc) return {configured:false};
+  if(Date.now()-_renderCache.at < 5*60*1000 && _renderCache.data) return _renderCache.data; // ৫ মিনিট cache — বারবার কল করে নিজেই bandwidth না খায়
+  return new Promise((resolve)=>{
+    const now=Date.now(), start=now-24*3600*1000;
+    const url = `https://api.render.com/v1/metrics/bandwidth?resource=${svc}&startTime=${new Date(start).toISOString()}&endTime=${new Date(now).toISOString()}`;
+    https.get(url,{headers:{Authorization:"Bearer "+key,Accept:"application/json"}},(r)=>{
+      let body="";r.on("data",c=>body+=c);
+      r.on("end",()=>{
+        try{
+          const j = JSON.parse(body);
+          const result = {configured:true, ok:r.statusCode===200, raw:j};
+          _renderCache={data:result, at:Date.now()};
+          resolve(result);
+        }catch(e){ resolve({configured:true, ok:false, error:"parse ব্যর্থ"}); }
+      });
+    }).on("error",e=>resolve({configured:true, ok:false, error:e.message}));
+  });
+}
+function getHeavyStatus(){
+  try{
+    const p = path.join(BDIR, ".heavy_status.json");
+    const raw = JSON.parse(fs.readFileSync(p,"utf8"));
+    if(Date.now()-raw.t > 15000) return null; // ১৫ সেকেন্ডের পুরনো হলে বাসি ধরে নেওয়া হচ্ছে (বট বন্ধ থাকতে পারে)
+    return {active:raw.active, max:raw.max};
+  }catch{ return null; }
+}
+app.get("/api/system/live",auth,async(req,res)=>{
+  let mongoStats = null;
+  if(db_connected && mongoose && mongoose.connection && mongoose.connection.db){
+    try{
+      const s = await mongoose.connection.db.stats();
+      mongoStats = {
+        dataSizeMB: +(s.dataSize/1024/1024).toFixed(2),
+        storageSizeMB: +(s.storageSize/1024/1024).toFixed(2),
+        indexSizeMB: +(s.indexSize/1024/1024).toFixed(2),
+        totalMB: +((s.dataSize+s.indexSize)/1024/1024).toFixed(2),
+        objects: s.objects
+      };
+    }catch(e){ mongoStats = {error: e.message}; }
+  }
+  const render = await getRenderBandwidth();
+  const panelMB = Math.round(process.memoryUsage().rss/1024/1024);
+  const botMB = getBotMemMB();
+
+  // ── লাইফটাইম সর্বোচ্চ রেকর্ড আপডেট (MongoDB-তে ব্যাকআপসহ, তাই restart হলেও হারায় না) ──
+  bumpLifetimePeak("peakPanelMB", panelMB);
+  bumpLifetimePeak("peakBotMB", botMB);
+  if(mongoStats && mongoStats.totalMB!=null) bumpLifetimePeak("peakMongoMB", mongoStats.totalMB);
+
+  res.json({
+    ok:true,
+    time: Date.now(),
+    ram: { panelMB, botMB, capMB: 512 }, // Render ফ্রি ইনস্ট্যান্সের হার্ড সীমা — প্রতিষ্ঠিত সত্য, API কল লাগে না
+    mongo: mongoStats,
+    render,
+    heavy: getHeavyStatus(),
+    lifetime: {
+      ...lifetime,
+      totalStarts: stats.starts||0,
+      totalCrashes: stats.crashes||0,
+      totalUptimeSec: stats.totalUptime||0
+    }
+  });
+});
+
+
 
 app.get("/api/backup",auth,(req,res)=>{
   res.setHeader("Content-Disposition",`attachment; filename="bot-backup-${Date.now()}.zip"`);
@@ -718,14 +860,14 @@ app.post("/api/settings/save",auth,(req,res)=>{
   Object.assign(cfg,req.body);
   if(req.body.autoRestart!==undefined) autoRestart=!!req.body.autoRestart;
   if(req.body.siteUrl) cfg.siteUrl=req.body.siteUrl.trim();
-  saveJ(CFG,cfg);
+  saveCfg();
   res.json({ok:true});
 });
 app.post("/api/settings/password",auth,(req,res)=>{
   const{current,newPass}=req.body;
   if(current!==PASS&&current!==cfg.password) return res.json({ok:false,msg:"বর্তমান পাসওয়ার্ড ভুল"});
   if(!newPass||newPass.length<4) return res.json({ok:false,msg:"কমপক্ষে ৪ অক্ষর"});
-  cfg.password=newPass;saveJ(CFG,cfg);res.json({ok:true,msg:"পাসওয়ার্ড পরিবর্তন হয়েছে"});
+  cfg.password=newPass;saveCfg();res.json({ok:true,msg:"পাসওয়ার্ড পরিবর্তন হয়েছে"});
 });
 
 // ── WS ──
@@ -849,6 +991,23 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,sans-
 .bst-up{font-size:11px;color:var(--mu);margin-top:2px}
 .bg2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .bg3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px}
+.mon-card{background:linear-gradient(135deg,var(--s2),var(--s3));border:1px solid var(--bd);border-radius:16px;padding:16px;margin-bottom:14px}
+.mon-head{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:800;color:#fff;margin-bottom:12px}
+.mon-row{margin-bottom:14px}
+.mon-row:last-child{margin-bottom:0}
+.mon-row-top{display:flex;justify-content:space-between;align-items:baseline;font-size:12px;margin-bottom:6px}
+.mon-row-label{color:var(--tx);font-weight:600}
+.mon-row-val{color:var(--mu);font-variant-numeric:tabular-nums}
+.mbar{height:10px;border-radius:6px;background:var(--s1);border:1px solid var(--bd);overflow:hidden}
+.mbar-fill{height:100%;border-radius:6px;transition:width .5s ease,background .5s ease}
+.mon-note{font-size:10px;color:var(--mu);margin-top:10px;line-height:1.5}
+.mon-peak{font-size:10px;color:var(--mu);margin-top:5px;display:flex;justify-content:flex-end;gap:4px}
+.mon-peak b{color:var(--bl);font-weight:700}
+.mon-badge{display:inline-block;font-size:10px;padding:2px 8px;border-radius:20px;margin-left:6px;font-weight:700}
+.mon-badge.ok{background:rgba(62,207,142,.15);color:var(--gr)}
+.mon-badge.warn{background:rgba(240,180,41,.15);color:var(--yw)}
+.mon-badge.err{background:rgba(240,82,82,.15);color:var(--rd)}
+.mon-badge.off{background:rgba(90,90,128,.2);color:var(--mu)}
 .btn{width:100%;padding:11px 8px;border-radius:12px;border:none;font-size:12px;font-weight:700;cursor:pointer;transition:.15s;display:flex;align-items:center;justify-content:center;gap:5px}
 .btn:active{transform:scale(.96)}
 .b-start{background:linear-gradient(135deg,#3ecf8e,#22d3ee);color:#000}
@@ -1019,6 +1178,72 @@ textarea.ci:focus{border-color:var(--ac)}
   </div>
 </div>
 
+<!-- LIVE MONITOR -->
+<div id="pg-monitor" class="page">
+  <div class="pg-title">📊 লাইভ সিস্টেম মনিটর</div>
+
+  <!-- CARD ১: RAM / Render রিসোর্স -->
+  <div class="mon-card">
+    <div class="mon-head">🖥️ RAM ব্যবহার <span class="mon-badge off">সীমা ৫১২MB</span></div>
+
+    <div class="mon-row" id="mHeavyRow" style="display:none">
+      <div class="mon-row-top"><span class="mon-row-label">⬇️ লাইভ ডাউনলোড</span><span class="mon-row-val" id="mHeavyTxt">-- / --</span></div>
+      <div class="mbar"><div class="mbar-fill" id="mHeavyBar" style="width:0%;background:var(--bl)"></div></div>
+    </div>
+
+    <div class="mon-row">
+      <div class="mon-row-top"><span class="mon-row-label">🧩 প্যানেল</span><span class="mon-row-val" id="mPanelTxt">-- MB / 512 MB</span></div>
+      <div class="mbar"><div class="mbar-fill" id="mPanelBar" style="width:0%;background:var(--gr)"></div></div>
+      <div class="mon-peak">📈 সর্বোচ্চ (লাইফটাইম): <b id="mPanelPeak">-- MB</b></div>
+    </div>
+
+    <div class="mon-row">
+      <div class="mon-row-top"><span class="mon-row-label">🤖 বট</span><span class="mon-row-val" id="mBotTxt">-- MB / 512 MB</span></div>
+      <div class="mbar"><div class="mbar-fill" id="mBotBar" style="width:0%;background:var(--gr)"></div></div>
+      <div class="mon-peak">📈 সর্বোচ্চ (লাইফটাইম): <b id="mBotPeak">-- MB</b></div>
+    </div>
+
+    <div class="mon-row">
+      <div class="mon-row-top"><span class="mon-row-label">⚡ মোট (প্যানেল+বট)</span><span class="mon-row-val" id="mTotalTxt">-- MB / 512 MB</span></div>
+      <div class="mbar"><div class="mbar-fill" id="mTotalBar" style="width:0%;background:var(--gr)"></div></div>
+    </div>
+
+    <div class="mon-row" id="mRenderRow" style="display:none">
+      <div class="mon-row-top"><span class="mon-row-label">🌐 Render ব্যান্ডউইথ (২৪ ঘণ্টা)<span class="mon-badge" id="mRenderBadge"></span></span><span class="mon-row-val" id="mRenderTxt"></span></div>
+    </div>
+    <div class="mon-note" id="mRenderNote">ℹ️ Render bandwidth সরাসরি দেখতে Render Dashboard → Account Settings-এ একটা API Key বানিয়ে <b>RENDER_API_KEY</b> আর <b>RENDER_SERVICE_ID</b> নামে Environment Variable হিসেবে বসিয়ে দাও — তাহলে এখানেও লাইভ দেখাবে। এই মুহূর্তে সঠিক মোট ব্যান্ডউইথ/মাসিক সীমার জন্য Render Dashboard-ই সবচেয়ে নির্ভরযোগ্য জায়গা।</div>
+  </div>
+
+  <!-- CARD ২: MongoDB স্টোরেজ -->
+  <div class="mon-card">
+    <div class="mon-head">🗄️ MongoDB Atlas স্টোরেজ <span class="mon-badge off">M0 সীমা ৫১২MB</span></div>
+
+    <div class="mon-row">
+      <div class="mon-row-top"><span class="mon-row-label">💽 ব্যবহৃত (ডেটা + ইনডেক্স)</span><span class="mon-row-val" id="mMongoTxt">-- MB / 512 MB</span></div>
+      <div class="mbar"><div class="mbar-fill" id="mMongoBar" style="width:0%;background:var(--gr)"></div></div>
+      <div class="mon-peak">📈 সর্বোচ্চ (লাইফটাইম): <b id="mMongoPeak">-- MB</b></div>
+    </div>
+
+    <div class="sg3" style="margin-top:12px">
+      <div class="sc"><div class="sc-i">📄</div><div class="sc-v" id="mMongoObjs" style="font-size:16px">--</div><div class="sc-l">মোট এন্ট্রি</div></div>
+      <div class="sc"><div class="sc-i">💾</div><div class="sc-v" id="mMongoData" style="font-size:16px">--</div><div class="sc-l">Data (MB)</div></div>
+      <div class="sc"><div class="sc-i">🔎</div><div class="sc-v" id="mMongoIdx" style="font-size:16px">--</div><div class="sc-l">Index (MB)</div></div>
+    </div>
+    <div class="mon-note">ℹ️ এই হিসাব MongoDB Atlas-এর ফ্রি (M0) টায়ারের ৫১২MB সীমা ধরে দেখানো হচ্ছে। অন্য টায়ার ব্যবহার করলে সীমা ভিন্ন হবে, তখন এই শতাংশ সরাসরি প্রযোজ্য না।</div>
+  </div>
+
+  <!-- CARD ৩: লাইফটাইম সামারি -->
+  <div class="mon-card">
+    <div class="mon-head">⏳ লাইফটাইম সামারি <span class="mon-badge ok">সব সময়ই সেভ হয়</span></div>
+    <div class="sg3">
+      <div class="sc"><div class="sc-i">🚀</div><div class="sc-v" id="mLtStarts" style="font-size:16px">--</div><div class="sc-l">মোট চালু হয়েছে</div></div>
+      <div class="sc"><div class="sc-i">💥</div><div class="sc-v" id="mLtCrashes" style="font-size:16px">--</div><div class="sc-l">মোট ক্র্যাশ</div></div>
+      <div class="sc"><div class="sc-i">🕒</div><div class="sc-v" id="mLtUptime" style="font-size:14px">--</div><div class="sc-l">মোট সচল সময়</div></div>
+    </div>
+    <div class="mon-note" style="margin-top:12px">📅 ট্র্যাক করা হচ্ছে যবে থেকে: <b id="mLtSince">--</b><br>ℹ️ এই সংখ্যাগুলো প্যানেল বা বট যতবারই restart হোক না কেন কখনো শূন্য হয়ে যায় না — MongoDB-তে স্থায়ীভাবে জমা থাকে।</div>
+  </div>
+</div>
+
 <!-- LOGS -->
 <div id="pg-logs" class="page">
   <div class="log-bar">
@@ -1165,6 +1390,7 @@ textarea.ci:focus{border-color:var(--ac)}
 <!-- TABS -->
 <div class="tabs">
   <button class="tab active" onclick="goTab('home',this)"><span class="ti">🏠</span><span class="tl">হোম</span></button>
+  <button class="tab" onclick="goTab('monitor',this)"><span class="ti">📊</span><span class="tl">মনিটর</span></button>
   <button class="tab" onclick="goTab('logs',this)"><span class="ti">📋</span><span class="tl">লগ</span></button>
   <button class="tab" onclick="goTab('files',this)"><span class="ti">📁</span><span class="tl">ফাইল</span></button>
   <button class="tab" onclick="goTab('upload',this)"><span class="ti">⬆️</span><span class="tl">আপলোড</span></button>
@@ -1193,6 +1419,7 @@ function goTab(id,btn){
   if(id==="more"){loadEnv();loadSettings();}
   if(id==="logs") document.getElementById("lbox").scrollTop=document.getElementById("lbox").scrollHeight;
   if(id==="upload"){document.getElementById("uploadDir").textContent=curDir||"root";}
+  if(id==="monitor") loadMonitor();
 }
 
 // WS
@@ -1299,7 +1526,75 @@ async function refresh(){
     const hist=(st.history||[]).slice().reverse().slice(0,8);
     const hl=document.getElementById("histList");
     if(hl)hl.innerHTML=hist.length?hist.map(h=>'<div class="hi"><span class="hi-date">'+new Date(h.date).toLocaleString("bn-BD").substring(0,16)+'</span><span class="hi-up">'+fmtT(h.uptime)+'</span><span class="hi-code">'+h.code+'</span></div>').join(""):'<div style="font-size:12px;color:var(--mu);text-align:center;padding:10px">ইতিহাস নেই</div>';
+    const pgMon=document.getElementById("pg-monitor");
+    if(pgMon&&pgMon.classList.contains("active")) loadMonitor();
   }catch{}
+}
+
+// LIVE MONITOR
+function _mColor(pct){ return pct<60?"var(--gr)":pct<85?"var(--yw)":"var(--rd)"; }
+async function loadMonitor(){
+  try{
+    const d=await fetch("/api/system/live").then(r=>r.json());
+    const cap=(d.ram&&d.ram.capMB)||512;
+
+    const pMB=d.ram&&d.ram.panelMB!=null?d.ram.panelMB:null;
+    const bMB=d.ram&&d.ram.botMB!=null?d.ram.botMB:null;
+    const tMB=(pMB||0)+(bMB||0);
+
+    if(pMB!=null){const p=Math.min(100,Math.round(pMB/cap*100));document.getElementById("mPanelTxt").textContent=pMB+" MB / "+cap+" MB";document.getElementById("mPanelBar").style.width=p+"%";document.getElementById("mPanelBar").style.background=_mColor(p);}
+    if(bMB!=null){const p=Math.min(100,Math.round(bMB/cap*100));document.getElementById("mBotTxt").textContent=bMB+" MB / "+cap+" MB";document.getElementById("mBotBar").style.width=p+"%";document.getElementById("mBotBar").style.background=_mColor(p);}
+    else {document.getElementById("mBotTxt").textContent="বট বন্ধ আছে";document.getElementById("mBotBar").style.width="0%";}
+    {const p=Math.min(100,Math.round(tMB/cap*100));document.getElementById("mTotalTxt").textContent=tMB+" MB / "+cap+" MB";document.getElementById("mTotalBar").style.width=p+"%";document.getElementById("mTotalBar").style.background=_mColor(p);}
+
+    const hr=document.getElementById("mHeavyRow");
+    if(d.heavy){
+      hr.style.display="block";
+      const p=Math.min(100,Math.round((d.heavy.active/d.heavy.max)*100));
+      document.getElementById("mHeavyTxt").textContent=d.heavy.active+" / "+d.heavy.max+" চলছে";
+      document.getElementById("mHeavyBar").style.width=p+"%";
+    } else { hr.style.display="none"; }
+
+    const rr=document.getElementById("mRenderRow"),rb=document.getElementById("mRenderBadge"),rt=document.getElementById("mRenderTxt"),rn=document.getElementById("mRenderNote");
+    if(d.render&&d.render.configured){
+      rr.style.display="block";
+      if(d.render.ok){rb.textContent="লাইভ";rb.className="mon-badge ok";rt.textContent="Render API থেকে ডেটা এসেছে (নিচে raw দেখুন প্রয়োজনে)";rn.style.display="none";}
+      else{rb.textContent="ব্যর্থ";rb.className="mon-badge err";rt.textContent=d.render.error||"API কল ব্যর্থ হয়েছে";}
+    } else { rr.style.display="none"; }
+
+    if(d.mongo&&!d.mongo.error){
+      const mCap=512; // Atlas M0 ফ্রি টায়ারের সীমা
+      const used=d.mongo.totalMB||0;
+      const p=Math.min(100,Math.round(used/mCap*100));
+      document.getElementById("mMongoTxt").textContent=used+" MB / "+mCap+" MB";
+      document.getElementById("mMongoBar").style.width=p+"%";
+      document.getElementById("mMongoBar").style.background=_mColor(p);
+      document.getElementById("mMongoObjs").textContent=d.mongo.objects!=null?d.mongo.objects:"--";
+      document.getElementById("mMongoData").textContent=d.mongo.dataSizeMB!=null?d.mongo.dataSizeMB:"--";
+      document.getElementById("mMongoIdx").textContent=d.mongo.indexSizeMB!=null?d.mongo.indexSizeMB:"--";
+    } else {
+      document.getElementById("mMongoTxt").textContent="সংযুক্ত নেই";
+      document.getElementById("mMongoBar").style.width="0%";
+    }
+
+    // লাইফটাইম পিক + সামারি (MongoDB থেকে, প্যানেল/বট যতবার restart হোক না কেন হারায় না)
+    if(d.lifetime){
+      const lt=d.lifetime;
+      document.getElementById("mPanelPeak").textContent=(lt.peakPanelMB||0)+" MB";
+      document.getElementById("mBotPeak").textContent=(lt.peakBotMB||0)+" MB";
+      document.getElementById("mMongoPeak").textContent=(lt.peakMongoMB||0)+" MB";
+      document.getElementById("mLtStarts").textContent=(lt.totalStarts||0)+" বার";
+      document.getElementById("mLtCrashes").textContent=(lt.totalCrashes||0)+" বার";
+      document.getElementById("mLtUptime").textContent=_fmtLifeUp(lt.totalUptimeSec||0);
+      document.getElementById("mLtSince").textContent=lt.firstSeen?new Date(lt.firstSeen).toLocaleDateString("bn-BD",{year:"numeric",month:"long",day:"numeric"}):"--";
+    }
+  }catch(e){}
+}
+function _fmtLifeUp(sec){
+  const d=Math.floor(sec/86400),h=Math.floor((sec%86400)/3600),m=Math.floor((sec%3600)/60);
+  if(d>0) return d+"দিন "+h+"ঘণ্টা";
+  if(h>0) return h+"ঘণ্টা "+m+"মিনিট";
+  return m+"মিনিট";
 }
 
 // BOT

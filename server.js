@@ -37,38 +37,36 @@ const MONGO_URI = process.env.MONGODB_URI || "mongodb+srv://belal:belal123456@cl
 function loadJ(f,def={}){try{return JSON.parse(fs.readFileSync(f,"utf8"));}catch{return def;}}
 function saveJ(f,d){try{fs.writeFileSync(f,JSON.stringify(d,null,2));}catch{}}
 
-// panel.config.json শুধু লোকাল ডিস্কে (ephemeral) থাকলে container restart এ হারিয়ে
-// যায় (Auto Restart টগল, পাসওয়ার্ড ইত্যাদি সব রিসেট হয়ে যায়) — তাই MongoDB তেও
-// একটা কপি রাখা হয়, boot এর সময় সেখান থেকে ফিরিয়ে আনা হয়
-function saveCfg(){
-  saveJ(CFG,cfg);
-  if(db_connected && FileModel){
-    FileModel.findOneAndUpdate(
-      {path:"__panel_config__"},
-      {path:"__panel_config__", content:Buffer.from(JSON.stringify(cfg)), isDir:false, mtime:new Date(), size:JSON.stringify(cfg).length},
-      {upsert:true}
-    ).catch(e=>console.log("⚠️ saveCfg mongo error:",e.message));
-  }
-}
-async function loadCfgFromMongo(){
-  try{
-    if(!db_connected||!FileModel) return;
-    const doc=await FileModel.findOne({path:"__panel_config__"});
-    if(doc && doc.content){
-      const saved=JSON.parse(doc.content.toString());
-      Object.assign(cfg, saved);
-      if(cfg.autoRestart!==undefined) autoRestart=!!cfg.autoRestart;
-      saveJ(CFG,cfg);
-      console.log("✅ প্যানেল সেটিংস MongoDB থেকে ফিরিয়ে আনা হয়েছে (Auto Restart:", autoRestart, ")");
-    }
-  }catch(e){console.log("⚠️ loadCfgFromMongo error:",e.message);}
-}
-
 let cfg   = loadJ(CFG);
 let stats = loadJ(SFILE,{starts:0,crashes:0,totalUptime:0,history:[],loginAttempts:{}});
 let lifetime = loadJ(LTFILE,{peakPanelMB:0,peakBotMB:0,peakMongoMB:0,firstSeen:new Date().toISOString()});
 const PASS = process.env.PANEL_PASSWORD || cfg.password || "admin123";
 if(!fs.existsSync(BDIR)) fs.mkdirSync(BDIR,{recursive:true});
+
+// ── ফোনে লাইভ পুশ নোটিফিকেশন (ntfy.sh — ফ্রি, সাইনআপ লাগে না) ──
+// প্রথমবার একটা ইউনিক টপিক বানানো হচ্ছে, স্থায়ীভাবে সেভ থাকবে — একবার ntfy অ্যাপে সাবস্ক্রাইব করলেই সব নোটিফিকেশন সরাসরি ফোনে চলে আসবে
+if(!cfg.ntfyTopic){
+  cfg.ntfyTopic = "belalbot-" + require("crypto").randomBytes(6).toString("hex");
+  saveJ(CFG,cfg);
+}
+const NTFY_TOPIC = process.env.NTFY_TOPIC || cfg.ntfyTopic;
+let _pushCooldowns = {}; // একই ধরনের নোটিফিকেশন বারবার স্প্যাম না করার জন্য
+function sendPush(title, message, {priority="default", tags="", cooldownKey=null, cooldownMs=0} = {}){
+  if(cooldownKey){
+    const last=_pushCooldowns[cooldownKey]||0;
+    if(Date.now()-last < cooldownMs) return; // এখনো কুলডাউনে, স্কিপ
+    _pushCooldowns[cooldownKey]=Date.now();
+  }
+  try{
+    const data = Buffer.from(message,"utf8");
+    const req = https.request({
+      hostname:"ntfy.sh", path:"/"+NTFY_TOPIC, method:"POST",
+      headers:{"Title":Buffer.from(title,"utf8").toString("base64"),"X-Title-Encoding":"base64","Priority":priority,"Tags":tags,"Content-Length":data.length}
+    }, r=>{ r.on("data",()=>{}); });
+    req.on("error", e=>console.log("⚠️ push notification ব্যর্থ:", e.message));
+    req.write(data); req.end();
+  }catch(e){ console.log("⚠️ push notification error:", e.message); }
+}
 
 // ── MONGODB ──
 let mongoose, FileModel, db_connected = false;
@@ -88,9 +86,6 @@ async function connectMongo(){
       size:    {type:Number, default:0}
     });
     FileModel = mongoose.models.BotFile || mongoose.model("BotFile", fileSchema);
-
-    // প্যানেল সেটিংস (Auto Restart টগল ইত্যাদি) MongoDB থেকে ফিরিয়ে আনা
-    await loadCfgFromMongo();
 
     // restore files from MongoDB on startup
     await restorePanelPersistent();
@@ -340,6 +335,7 @@ function startBot(by="manual"){
           time: new Date().toISOString(), code: code||sig, uptimeSec: up
         }));
       }catch{}
+      sendPush("🔴 বট ক্র্যাশ করেছে!", `কোড: ${code||sig} | আগের সেশন সচল ছিল: ${fmtS(up)}\nAuto-restart চেষ্টা চলছে...`, {priority:"high", tags:"rotating_light"});
     }
     saveJ(SFILE,stats); savePanelStatsToMongo();
     log(`🔴 বট বন্ধ (code:${code||sig}, uptime:${fmtS(up)})`,"error");
@@ -390,6 +386,39 @@ setInterval(()=>{
   }
 },10000);
 
+// ── প্রতিরোধমূলক RAM গার্ড ── প্যানেল খোলা থাকুক বা না থাকুক, প্রতি ৩০ সেকেন্ডে ব্যাকগ্রাউন্ডে
+// নিজে থেকেই চেক করে — RAM যদি ক্রমাগত ৪৭০MB+ থাকে (Render-এর ৫১২MB হার্ড সীমার কাছাকাছি),
+// তাহলে OOM crash হওয়ার আগেই বট নিজে থেকে গ্রেসফুলি রিস্টার্ট করে দেয় — আর ফোনে সাথে সাথে জানিয়ে দেয়
+let _highRamStreak = 0;
+setInterval(()=>{
+  if(!botProc) { _highRamStreak=0; return; }
+  const botMB = getBotMemMB();
+  if(botMB==null) return;
+  if(botMB >= 470){
+    _highRamStreak++;
+    if(_highRamStreak>=3){ // পরপর ৩ বার (≈১.৫ মিনিট) উচ্চ থাকলেই তবে রিস্টার্ট — এক-দুইবারের স্পাইকে না
+      log(`🛡️ প্রতিরোধমূলক রিস্টার্ট — বট RAM ${botMB}MB (৫১২MB সীমার কাছাকাছি)`,"warn");
+      sendPush("🛡️ প্রতিরোধমূলক রিস্টার্ট", `বট RAM ${botMB}MB ছুঁয়ে ফেলেছিল (সীমা ৫১২MB) — ক্র্যাশ হওয়ার আগেই নিজে থেকে নিরাপদে রিস্টার্ট করা হলো।`, {priority:"default", tags:"shield", cooldownKey:"preventive-restart", cooldownMs:10*60*1000});
+      _highRamStreak=0;
+      stopBot(); setTimeout(()=>startBot("preventive-ram-guard"),3000);
+    }
+  } else {
+    _highRamStreak=0;
+  }
+},30*1000);
+
+// ── MongoDB স্টোরেজ প্রায় শেষ হয়ে গেলে দিনে একবার সতর্ক করা ──
+setInterval(async()=>{
+  if(!db_connected || !mongoose?.connection?.db) return;
+  try{
+    const s = await mongoose.connection.db.stats();
+    const usedMB = (s.dataSize+s.indexSize)/1024/1024;
+    if(usedMB > 512*0.85){
+      sendPush("⚠️ MongoDB স্টোরেজ প্রায় শেষ", `${Math.round(usedMB)}MB / 512MB ব্যবহার হয়ে গেছে (Atlas M0 ফ্রি সীমা)। পুরনো/অপ্রয়োজনীয় ডেটা সরানো দরকার হতে পারে।`, {priority:"default", tags:"warning", cooldownKey:"mongo-storage-warn", cooldownMs:24*60*60*1000});
+    }
+  }catch{}
+},30*60*1000); // প্রতি ৩০ মিনিটে চেক, কিন্তু নোটিফিকেশন দিনে একবারের বেশি না (cooldown দিয়ে)
+
 // ── ROUTES: AUTH ──
 app.get("/ping",(req,res)=>res.json({ok:true,running:!!botProc,mongo:db_connected,time:new Date().toISOString()}));
 app.get("/health",(req,res)=>res.json({ok:true}));
@@ -413,7 +442,7 @@ app.post("/api/bot/install", auth,(req,res)=>{
   try{log("📦 npm install চলছে...","warn");execSync("npm install",{cwd:BDIR,timeout:180000});log("✅ সম্পন্ন","success");res.json({ok:true,msg:"npm install সম্পন্ন"});}
   catch(e){log("❌ npm install ব্যর্থ: "+e.message,"error");res.json({ok:false,msg:e.message});}
 });
-app.post("/api/bot/autorestart",auth,(req,res)=>{autoRestart=!!req.body.enabled;cfg.autoRestart=autoRestart;saveCfg();res.json({ok:true,enabled:autoRestart});});
+app.post("/api/bot/autorestart",auth,(req,res)=>{autoRestart=!!req.body.enabled;cfg.autoRestart=autoRestart;saveJ(CFG,cfg);res.json({ok:true,enabled:autoRestart});});
 app.get("/api/bot/downloadlog",auth,(req,res)=>{if(fs.existsSync(LFILE))res.download(LFILE,"bot.log");else res.status(404).send("No log");});
 app.post("/api/bot/clearlogfile",auth,(req,res)=>{try{fs.writeFileSync(LFILE,"");res.json({ok:true});}catch(e){res.json({ok:false,msg:e.message});}});
 
@@ -856,18 +885,22 @@ app.post("/api/cookie/save",auth,async(req,res)=>{
 
 // ── SETTINGS ──
 app.get("/api/settings",auth,(req,res)=>res.json({...cfg,mongoConnected:db_connected}));
+app.post("/api/notify/test",auth,(req,res)=>{
+  sendPush("🔔 টেস্ট নোটিফিকেশন", "এটা একটা টেস্ট মেসেজ — যদি এটা দেখতে পাচ্ছো, তাহলে সেটআপ ঠিকভাবে হয়ে গেছে! ✅", {priority:"default", tags:"white_check_mark"});
+  res.json({ok:true});
+});
 app.post("/api/settings/save",auth,(req,res)=>{
   Object.assign(cfg,req.body);
   if(req.body.autoRestart!==undefined) autoRestart=!!req.body.autoRestart;
   if(req.body.siteUrl) cfg.siteUrl=req.body.siteUrl.trim();
-  saveCfg();
+  saveJ(CFG,cfg);
   res.json({ok:true});
 });
 app.post("/api/settings/password",auth,(req,res)=>{
   const{current,newPass}=req.body;
   if(current!==PASS&&current!==cfg.password) return res.json({ok:false,msg:"বর্তমান পাসওয়ার্ড ভুল"});
   if(!newPass||newPass.length<4) return res.json({ok:false,msg:"কমপক্ষে ৪ অক্ষর"});
-  cfg.password=newPass;saveCfg();res.json({ok:true,msg:"পাসওয়ার্ড পরিবর্তন হয়েছে"});
+  cfg.password=newPass;saveJ(CFG,cfg);res.json({ok:true,msg:"পাসওয়ার্ড পরিবর্তন হয়েছে"});
 });
 
 // ── WS ──
@@ -1353,6 +1386,23 @@ textarea.ci:focus{border-color:var(--ac)}
       <button class="tbtn" onclick="mongoRestore()">🔄 Restore</button>
     </div>
     <div style="font-size:11px;color:var(--mu);margin-top:10px">💡 Sync করলে সব ফাইল MongoDB তে সেভ হবে। Render restart হলে অটো restore হবে।</div>
+  </div>
+
+  <!-- PUSH NOTIFICATIONS -->
+  <div class="set-card">
+    <div class="set-title">📲 ফোনে লাইভ নোটিফিকেশন</div>
+    <div style="font-size:12px;color:var(--tx);line-height:1.8;margin-bottom:12px">
+      <b>একবারই সেটআপ করতে হবে:</b><br>
+      ১. Play Store থেকে <b>ntfy</b> অ্যাপ (বিনামূল্যে) ইনস্টল করো<br>
+      ২. অ্যাপ খুলে "+" চেপে নিচের টপিক নামটা বসিয়ে সাবস্ক্রাইব করো<br>
+      ৩. ব্যস — বট ক্র্যাশ করলে, RAM বেশি হলে, বা MongoDB প্রায় শেষ হয়ে গেলে সাথে সাথে ফোনে নোটিফিকেশন আসবে
+    </div>
+    <div class="set-row"><div class="sr-l">টপিক নাম</div><input class="sinp" type="text" id="sNtfyTopic" readonly style="font-family:monospace"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+      <button class="tbtn" onclick="copyNtfyTopic()">📋 কপি করো</button>
+      <button class="tbtn p" onclick="testPush()">🔔 টেস্ট নোটিফিকেশন পাঠাও</button>
+    </div>
+    <div style="font-size:10px;color:var(--mu);margin-top:10px">🔗 ব্রাউজার থেকেও দেখা যায়: <span id="sNtfyLink" style="color:var(--bl)"></span></div>
   </div>
 
   <!-- SETTINGS -->
@@ -1876,6 +1926,8 @@ async function loadSettings(){
   document.getElementById("sAR").checked=d.autoRestart||false;
   document.getElementById("sSched").checked=d.scheduleRestart||false;
   document.getElementById("sTime").value=d.scheduleTime||"03:00";
+  const ntTopic=document.getElementById("sNtfyTopic");
+  if(ntTopic){ ntTopic.value=d.ntfyTopic||""; document.getElementById("sNtfyLink").textContent="ntfy.sh/"+(d.ntfyTopic||""); }
   const mi=document.getElementById("mongoInfo");
   if(mi) mi.textContent=d.mongoConnected?"MongoDB সংযুক্ত ✅":"MongoDB বিচ্ছিন্ন ❌";
 }
@@ -1888,6 +1940,16 @@ async function changePw(){
   const d=await fetch("/api/settings/password",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({current:document.getElementById("sCur").value,newPass:document.getElementById("sNew").value})}).then(r=>r.json());
   toast(d.ok?"✅ "+d.msg:"❌ "+d.msg,d.ok?"success":"error");
   if(d.ok){document.getElementById("sCur").value="";document.getElementById("sNew").value="";}
+}
+function copyNtfyTopic(){
+  const v=document.getElementById("sNtfyTopic").value;
+  if(!v) return;
+  navigator.clipboard?.writeText(v).then(()=>toast("📋 কপি হয়েছে","success")).catch(()=>toast("❌ কপি ব্যর্থ","error"));
+}
+async function testPush(){
+  toast("⏳ পাঠানো হচ্ছে...","success");
+  const d=await fetch("/api/notify/test",{method:"POST"}).then(r=>r.json()).catch(()=>null);
+  toast(d&&d.ok?"✅ পাঠানো হয়েছে — ১০-১৫ সেকেন্ডে ফোনে দেখো":"❌ ব্যর্থ হয়েছে",d&&d.ok?"success":"error");
 }
 
 // TOAST

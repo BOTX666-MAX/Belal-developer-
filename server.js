@@ -8,7 +8,7 @@ const fs        = require("fs");
 const path      = require("path");
 const https     = require("https");
 const http2     = require("http");
-const { spawn, execSync } = require("child_process");
+const { spawn, fork, execSync } = require("child_process");
 const archiver  = require("archiver");
 const unzipper  = require("unzipper");
 
@@ -199,6 +199,13 @@ async function deleteFromMongo(relPath){
   } catch(e){ console.log("⚠️ mongo delete error:", e.message); }
 }
 
+// প্যানেল থেকে ফাইল অ্যাড/এডিট/ডিলিট হলে সাথে সাথে (fs.watch-এর অপেক্ষা না করে) বটকে সরাসরি IPC দিয়ে জানানো —
+// fs.watch কিছু কন্টেইনার ফাইলসিস্টেমে অনির্ভরযোগ্য/দেরিতে ফায়ার করতে পারে, IPC সবসময় তাৎক্ষণিক ও নির্ভরযোগ্য
+function notifyBotFile(action, relPath){
+  if(!botProc || !botProc.connected) return;
+  try{ botProc.send({ type: "panel_file_change", action, relPath }); }catch{}
+}
+
 // ── প্যানেলের নিজস্ব stats.json ও lifetime.json MongoDB-তে ব্যাকআপ/রিস্টোর ──
 // (Render-এর ডিস্ক ephemeral, তাই এগুলো শুধু ডিস্কে রাখলে প্যানেল restart হলেই "লাইফটাইম" হিসাব শূন্য হয়ে যেত)
 async function savePanelStatsToMongo(){ await saveToMongo("__panel_stats__", JSON.stringify(stats), false); }
@@ -271,7 +278,7 @@ const auth = (req,res,next) => req.session.ok ? next() : res.redirect("/login");
 const safe = (base,rel) => { const f=path.resolve(base,rel||""); if(!f.startsWith(path.resolve(base))) throw new Error("Access denied"); return f; };
 
 // ── BOT ──
-let botProc=null, botLogs=[], botStart=null, autoRestart=cfg.autoRestart||false, rsTimer=null, _consecutiveCrashes=0;
+let botProc=null, botLogs=[], botStart=null, botReady=false, autoRestart=true, rsTimer=null, _consecutiveCrashes=0; // ── Auto-Restart সবসময় ON থাকবে (ইউজারের সিদ্ধান্ত অনুযায়ী) — বন্ধ করার অপশন সরিয়ে দেওয়া হয়েছে
 
 function bc(d){wss.clients.forEach(c=>{if(c.readyState===WebSocket.OPEN)c.send(JSON.stringify(d));});}
 
@@ -308,50 +315,80 @@ function startBot(by="manual"){
   if(botProc) return {ok:false,msg:"বট ইতিমধ্যে চলছে"};
   const idx=["index.js","app.js","main.js","bot.js","start.js"].find(f=>fs.existsSync(path.join(BDIR,f)));
   if(!idx) return {ok:false,msg:"index.js পাওয়া যায়নি — বট আপলোড করুন"};
-  const pkgFile=path.join(BDIR,"package.json");
   const nmDir=path.join(BDIR,"node_modules");
-  if(!fs.existsSync(nmDir)){
-    try{log("📦 npm install চলছে...","warn");execSync("npm install",{cwd:BDIR,timeout:180000});log("✅ npm install সম্পন্ন","success");}
-    catch(e){log("⚠️ npm install সমস্যা: "+e.message,"error");}
+
+  function actuallySpawnBot(){
+    botProc=fork(idx,[],{cwd:BDIR,env:{...process.env,FORCE_COLOR:"1"},stdio:["ignore","pipe","pipe","ipc"]});
+    botStart=Date.now(); botReady=false; stats.starts++; saveJ(SFILE,stats); savePanelStatsToMongo();
+    setShouldRun(true);
+    log(`🟡 বট চালু হচ্ছে (${by}) — ${idx}`,"warn"); bc({type:"status",running:false,starting:true});
+    const NOISY=[/Warning: Accessing non-existent property/i,/circular dependency/i,/--trace-warnings/i,/\[DEP\d+\]/i,/is deprecated\. Please use/i];
+    const isNoisy=s=>NOISY.some(rx=>rx.test(s));
+    // eslint-disable-next-line no-control-regex
+    const stripAnsi=s=>s.replace(/\x1B\[[0-9;]*[a-zA-Z]/g,"");
+    botProc.stdout.on("data",d=>{const s=stripAnsi(d.toString()).trim();if(s&&!isNoisy(s))log(s,"info");});
+    botProc.stderr.on("data",d=>{const s=stripAnsi(d.toString()).trim();if(s&&!isNoisy(s))log(s,"error");});
+    botProc.on("message",(msg)=>{
+      if(msg?.type==="bot_ready"){
+        botReady=true;
+        log(`✅ বট সম্পূর্ণ প্রস্তুত — ${msg.commands||0} কমান্ড লোড হয়েছে (${msg.failed||0} ব্যর্থ)`,"success");
+        bc({type:"status",running:true,starting:false,ready:true});
+      }
+    });
+    botProc.on("exit",(code,sig)=>{
+      const up=botStart?Math.floor((Date.now()-botStart)/1000):0;
+      stats.totalUptime+=up; stats.history.push({date:new Date().toISOString(),uptime:up,code:code||sig});
+      if(stats.history.length>100) stats.history.shift();
+      if(code!==0&&code!==null){
+        stats.crashes++;
+        try{
+          fs.writeFileSync(path.join(BDIR,".crash_flag.json"), JSON.stringify({
+            time: new Date().toISOString(), code: code||sig, uptimeSec: up
+          }));
+        }catch{}
+        sendPush("🔴 বট ক্র্যাশ করেছে!", `কোড: ${code||sig} | আগের সেশন সচল ছিল: ${fmtS(up)}\nAuto-restart চেষ্টা চলছে...`, {priority:"high", tags:"rotating_light"});
+      }
+      saveJ(SFILE,stats); savePanelStatsToMongo();
+      log(`🔴 বট বন্ধ (code:${code||sig}, uptime:${fmtS(up)})`,"error");
+      botProc=null; botStart=null; botReady=false; bc({type:"status",running:false,starting:false,ready:false});
+      if(autoRestart&&code!==0&&code!==null){
+        // ── উঠতি-ধাপে অপেক্ষা (exponential backoff) ──
+        // দ্রুত/বারবার ক্র্যাশ হলে (বিশেষত ফেসবুকের 429 rate-limit) প্রতিবার
+        // অপেক্ষার সময় বাড়বে, যাতে ফেসবুককে বারবার বিরক্ত করে ব্লক আরও
+        // দীর্ঘায়িত না করি। বট মোটামুটি স্থিতিশীলভাবে (২ মিনিট+) চললে
+        // কাউন্টার রিসেট হয়ে যাবে।
+        if(up>=120) _consecutiveCrashes=0; else _consecutiveCrashes++;
+        const waitSec=Math.min(10*Math.pow(2,_consecutiveCrashes),300); // ১০সে থেকে সর্বোচ্চ ৫মিনিট
+        log(`🔄 Auto-restart ${waitSec} সেকেন্ড পরে... (পরপর ${_consecutiveCrashes} বার ক্র্যাশ)`,"warn");
+        rsTimer=setTimeout(()=>startBot("auto-restart"),waitSec*1000);
+      }
+    });
   }
-  botProc=spawn("node",[idx],{cwd:BDIR,env:{...process.env,FORCE_COLOR:"1"}});
-  botStart=Date.now(); stats.starts++; saveJ(SFILE,stats); savePanelStatsToMongo();
-  setShouldRun(true);
-  log(`🟢 বট চালু (${by}) — ${idx}`,"success"); bc({type:"status",running:true});
-  const NOISY=[/Warning: Accessing non-existent property/i,/circular dependency/i,/--trace-warnings/i,/\[DEP\d+\]/i,/is deprecated\. Please use/i];
-  const isNoisy=s=>NOISY.some(rx=>rx.test(s));
-  // eslint-disable-next-line no-control-regex
-  const stripAnsi=s=>s.replace(/\x1B\[[0-9;]*[a-zA-Z]/g,"");
-  botProc.stdout.on("data",d=>{const s=stripAnsi(d.toString()).trim();if(s&&!isNoisy(s))log(s,"info");});
-  botProc.stderr.on("data",d=>{const s=stripAnsi(d.toString()).trim();if(s&&!isNoisy(s))log(s,"error");});
-  botProc.on("exit",(code,sig)=>{
-    const up=botStart?Math.floor((Date.now()-botStart)/1000):0;
-    stats.totalUptime+=up; stats.history.push({date:new Date().toISOString(),uptime:up,code:code||sig});
-    if(stats.history.length>100) stats.history.shift();
-    if(code!==0&&code!==null){
-      stats.crashes++;
-      try{
-        fs.writeFileSync(path.join(BDIR,".crash_flag.json"), JSON.stringify({
-          time: new Date().toISOString(), code: code||sig, uptimeSec: up
-        }));
-      }catch{}
-      sendPush("🔴 বট ক্র্যাশ করেছে!", `কোড: ${code||sig} | আগের সেশন সচল ছিল: ${fmtS(up)}\nAuto-restart চেষ্টা চলছে...`, {priority:"high", tags:"rotating_light"});
-    }
-    saveJ(SFILE,stats); savePanelStatsToMongo();
-    log(`🔴 বট বন্ধ (code:${code||sig}, uptime:${fmtS(up)})`,"error");
-    botProc=null; botStart=null; bc({type:"status",running:false});
-    if(autoRestart&&code!==0&&code!==null){
-      // ── উঠতি-ধাপে অপেক্ষা (exponential backoff) ──
-      // দ্রুত/বারবার ক্র্যাশ হলে (বিশেষত ফেসবুকের 429 rate-limit) প্রতিবার
-      // অপেক্ষার সময় বাড়বে, যাতে ফেসবুককে বারবার বিরক্ত করে ব্লক আরও
-      // দীর্ঘায়িত না করি। বট মোটামুটি স্থিতিশীলভাবে (২ মিনিট+) চললে
-      // কাউন্টার রিসেট হয়ে যাবে।
-      if(up>=120) _consecutiveCrashes=0; else _consecutiveCrashes++;
-      const waitSec=Math.min(10*Math.pow(2,_consecutiveCrashes),300); // ১০সে থেকে সর্বোচ্চ ৫মিনিট
-      log(`🔄 Auto-restart ${waitSec} সেকেন্ড পরে... (পরপর ${_consecutiveCrashes} বার ক্র্যাশ)`,"warn");
-      rsTimer=setTimeout(()=>startBot("auto-restart"),waitSec*1000);
-    }
-  });
+
+  if(!fs.existsSync(nmDir)){
+    // ⚠️ আগে এখানে execSync ব্যবহার হতো, যেটা npm install শেষ না হওয়া পর্যন্ত
+    // পুরো ওয়েবসাইটকেই (Express সার্ভার) ফ্রিজ করে রাখত — এখন async spawn,
+    // তাই ওয়েবসাইট npm install চলাকালীনও স্বাভাবিকভাবে খোলা/ব্যবহার করা যাবে
+    log("📦 npm install চলছে (ব্যাকগ্রাউন্ডে — ওয়েবসাইট এখনো স্বাভাবিকভাবে খোলা যাবে)...","warn");
+    bc({type:"status",running:false,installing:true});
+    const npmProc = spawn(process.platform==="win32"?"npm.cmd":"npm", ["install","--no-audit","--no-fund"], {cwd:BDIR});
+    let npmErr="";
+    npmProc.stderr.on("data",d=>{npmErr+=d.toString();});
+    npmProc.on("exit",(code)=>{
+      if(code===0){
+        log("✅ npm install সম্পন্ন","success");
+        actuallySpawnBot();
+      } else {
+        log("⚠️ npm install ব্যর্থ (code "+code+"): "+npmErr.slice(-300),"error");
+        sendPush("⚠️ npm install ব্যর্থ", "বট চালু করা যায়নি — dependency install fail করেছে। প্যানেলের লগ দেখো।", {priority:"high", tags:"warning"});
+        bc({type:"status",running:false});
+      }
+    });
+    npmProc.on("error",(e)=>{ log("⚠️ npm install চালু করতে ব্যর্থ: "+e.message,"error"); });
+    return {ok:true,msg:"📦 npm install ব্যাকগ্রাউন্ডে শুরু হয়েছে — একটু পর বট নিজে থেকেই চালু হয়ে যাবে, ওয়েবসাইট এখনই স্বাভাবিকভাবে ব্যবহার করা যাবে"};
+  }
+
+  actuallySpawnBot();
   return {ok:true,msg:"বট চালু হয়েছে"};
 }
 
@@ -359,7 +396,7 @@ function stopBot(){
   if(rsTimer){clearTimeout(rsTimer);rsTimer=null;}
   if(!botProc) return {ok:false,msg:"বট চলছে না"};
   try{botProc.kill("SIGTERM");setTimeout(()=>{try{if(botProc)botProc.kill("SIGKILL");}catch{}},5000);}catch{}
-  botProc=null; botStart=null;
+  botProc=null; botStart=null; botReady=false;
   setShouldRun(false);
   log("🔴 বট বন্ধ করা হয়েছে","warn"); bc({type:"status",running:false});
   return {ok:true,msg:"বট বন্ধ হয়েছে"};
@@ -434,21 +471,28 @@ app.get("/"   ,auth,(req,res)=>res.send(mainHTML()));
 app.post("/api/bot/start",   auth,(req,res)=>res.json(startBot()));
 app.post("/api/bot/stop",    auth,(req,res)=>res.json(stopBot()));
 app.post("/api/bot/restart", auth,(req,res)=>{stopBot();setTimeout(()=>res.json(startBot("restart")),2000);});
-app.get("/api/bot/status",   auth,(req,res)=>res.json({running:!!botProc,uptime:botStart?Math.floor((Date.now()-botStart)/1000):0}));
+app.get("/api/bot/status",   auth,(req,res)=>res.json({running:!!botProc,ready:botReady,uptime:botStart?Math.floor((Date.now()-botStart)/1000):0}));
 app.get("/api/bot/logs",     auth,(req,res)=>res.json({logs:botLogs}));
 app.post("/api/bot/clearlogs",auth,(req,res)=>{botLogs=[];bc({type:"clearLogs"});res.json({ok:true});});
 app.post("/api/bot/install", auth,(req,res)=>{
   if(!fs.existsSync(path.join(BDIR,"package.json"))) return res.json({ok:false,msg:"package.json নেই"});
-  try{log("📦 npm install চলছে...","warn");execSync("npm install",{cwd:BDIR,timeout:180000});log("✅ সম্পন্ন","success");res.json({ok:true,msg:"npm install সম্পন্ন"});}
-  catch(e){log("❌ npm install ব্যর্থ: "+e.message,"error");res.json({ok:false,msg:e.message});}
+  log("📦 npm install চলছে (ব্যাকগ্রাউন্ডে)...","warn");
+  const npmProc = spawn(process.platform==="win32"?"npm.cmd":"npm", ["install","--no-audit","--no-fund"], {cwd:BDIR});
+  let npmErr="";
+  npmProc.stderr.on("data",d=>{npmErr+=d.toString();});
+  npmProc.on("exit",(code)=>{
+    if(code===0) log("✅ npm install সম্পন্ন","success");
+    else log("❌ npm install ব্যর্থ: "+npmErr.slice(-300),"error");
+  });
+  res.json({ok:true,msg:"📦 npm install ব্যাকগ্রাউন্ডে শুরু হয়েছে — লগে অগ্রগতি দেখতে পারবে"});
 });
-app.post("/api/bot/autorestart",auth,(req,res)=>{autoRestart=!!req.body.enabled;cfg.autoRestart=autoRestart;saveJ(CFG,cfg);res.json({ok:true,enabled:autoRestart});});
+app.post("/api/bot/autorestart",auth,(req,res)=>{autoRestart=true;cfg.autoRestart=true;saveJ(CFG,cfg);res.json({ok:true,enabled:true,note:"Auto-Restart সবসময় ON থাকে, বন্ধ করা যায় না"});});
 app.get("/api/bot/downloadlog",auth,(req,res)=>{if(fs.existsSync(LFILE))res.download(LFILE,"bot.log");else res.status(404).send("No log");});
 app.post("/api/bot/clearlogfile",auth,(req,res)=>{try{fs.writeFileSync(LFILE,"");res.json({ok:true});}catch(e){res.json({ok:false,msg:e.message});}});
 
 app.get("/api/stats",auth,(req,res)=>{
   function countF(d){let c=0;try{fs.readdirSync(d).forEach(f=>{const s=fs.statSync(path.join(d,f));c+=s.isDirectory()?countF(path.join(d,f)):1;});}catch{}return c;}
-  res.json({...stats,running:!!botProc,currentUptime:botStart?Math.floor((Date.now()-botStart)/1000):0,
+  res.json({...stats,running:!!botProc,ready:botReady,currentUptime:botStart?Math.floor((Date.now()-botStart)/1000):0,
     autoRestart,memMB:Math.round(process.memoryUsage().rss/1024/1024),
     serverUptime:Math.floor(process.uptime()),node:process.version,
     botFiles:countF(BDIR),mongoConnected:db_connected});
@@ -492,6 +536,53 @@ function getHeavyStatus(){
     return {active:raw.active, max:raw.max};
   }catch{ return null; }
 }
+
+// ── নেটওয়ার্ক থ্রুপুট (রিয়েল, /proc/net/dev থেকে) — হ্যাকিং-স্টাইল টার্মিনাল ট্যাবের জন্য ──
+let _netPrev = null;
+function readNetBytes(){
+  try{
+    const raw = fs.readFileSync("/proc/net/dev","utf8");
+    let rx=0, tx=0;
+    raw.split("\n").slice(2).forEach(line=>{
+      const m = line.trim().match(/^([\w.]+):\s*(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)/);
+      if(m && m[1]!=="lo"){ rx += parseInt(m[2],10); tx += parseInt(m[3],10); }
+    });
+    return {rx, tx, t: Date.now()};
+  }catch{ return null; }
+}
+function getNetSpeed(){
+  const now = readNetBytes();
+  if(!now) return {rxKBs:null, txKBs:null};
+  if(!_netPrev){ _netPrev = now; return {rxKBs:0, txKBs:0}; }
+  const dt = (now.t - _netPrev.t)/1000;
+  const rxKBs = dt>0 ? Math.max(0, +((now.rx-_netPrev.rx)/1024/dt).toFixed(1)) : 0;
+  const txKBs = dt>0 ? Math.max(0, +((now.tx-_netPrev.tx)/1024/dt).toFixed(1)) : 0;
+  _netPrev = now;
+  return {rxKBs, txKBs};
+}
+let _cpuPrev = null;
+function getCpuPercent(){
+  const usage = process.cpuUsage(); // মাইক্রোসেকেন্ডে, প্যানেল প্রসেসের নিজের CPU সময়
+  const now = Date.now();
+  if(!_cpuPrev){ _cpuPrev = {usage, t:now}; return 0; }
+  const dtMs = now - _cpuPrev.t;
+  const cpuMs = (usage.user - _cpuPrev.usage.user + usage.system - _cpuPrev.usage.system)/1000;
+  _cpuPrev = {usage, t:now};
+  if(dtMs<=0) return 0;
+  return Math.min(100, Math.round((cpuMs/dtMs)*100));
+}
+app.get("/api/system/terminal",auth,(req,res)=>{
+  const net = getNetSpeed();
+  const botMB = getBotMemMB(), panelMB = Math.round(process.memoryUsage().rss/1024/1024);
+  res.json({
+    ok:true, time:Date.now(),
+    net,
+    cpuPercent: getCpuPercent(),
+    ramPercent: Math.min(100, Math.round(((botMB||0)+panelMB)/512*100)),
+    botRunning: !!botProc, botReady, heavy: getHeavyStatus()
+  });
+});
+
 app.get("/api/system/live",auth,async(req,res)=>{
   let mongoStats = null;
   if(db_connected && mongoose && mongoose.connection && mongoose.connection.db){
@@ -567,6 +658,7 @@ app.post("/api/file/save",auth,async(req,res)=>{
     // MongoDB তে সেভ
     const relPath = path.relative(BDIR,f);
     await saveToMongo(relPath, req.body.content||"");
+    notifyBotFile("save", relPath);
     res.json({ok:true});
   }catch(e){res.status(500).json({error:e.message});}
 });
@@ -577,6 +669,7 @@ app.post("/api/file/delete",auth,async(req,res)=>{
     const relPath = path.relative(BDIR,f);
     fs.rmSync(f,{recursive:true,force:true});
     await deleteFromMongo(relPath);
+    notifyBotFile("delete", relPath);
     res.json({ok:true});
   }catch(e){res.status(500).json({error:e.message});}
 });
@@ -603,6 +696,8 @@ app.post("/api/file/rename",auth,async(req,res)=>{
     await deleteFromMongo(fromRel);
     if(stat.isDirectory()) await syncDirToMongo(to,toRel);
     else await saveToMongo(toRel,fs.readFileSync(to));
+    notifyBotFile("delete", fromRel);
+    if(!stat.isDirectory()) notifyBotFile("save", toRel);
     res.json({ok:true});
   }catch(e){res.status(500).json({error:e.message});}
 });
@@ -616,6 +711,7 @@ app.post("/api/file/newfile",auth,async(req,res)=>{
     fs.writeFileSync(f,content);
     const relPath=path.relative(BDIR,f);
     await saveToMongo(relPath,content);
+    notifyBotFile("save", relPath);
     res.json({ok:true});
   }catch(e){res.status(500).json({error:e.message});}
 });
@@ -891,7 +987,7 @@ app.post("/api/notify/test",auth,(req,res)=>{
 });
 app.post("/api/settings/save",auth,(req,res)=>{
   Object.assign(cfg,req.body);
-  if(req.body.autoRestart!==undefined) autoRestart=!!req.body.autoRestart;
+  autoRestart=true; cfg.autoRestart=true; // ── সবসময় ON, সেটিংস থেকে বন্ধ করা যাবে না
   if(req.body.siteUrl) cfg.siteUrl=req.body.siteUrl.trim();
   saveJ(CFG,cfg);
   res.json({ok:true});
@@ -990,6 +1086,7 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,sans-
 .top-logo{width:34px;height:34px;background:linear-gradient(135deg,var(--ac),#ff6584);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;box-shadow:0 0 20px rgba(108,99,255,.4);transition:box-shadow .4s}
 .top-logo svg{width:20px;height:20px;filter:drop-shadow(0 0 2px rgba(255,255,255,.4))}
 .top-logo.live{animation:logoPulse 1.8s ease-in-out infinite}
+.top-logo.starting{animation:logoPulse 0.8s ease-in-out infinite;filter:hue-rotate(60deg)}
 @keyframes logoPulse{
   0%,100%{box-shadow:0 0 20px rgba(108,99,255,.4),0 0 0 0 rgba(46,213,115,.5)}
   50%{box-shadow:0 0 28px rgba(108,99,255,.7),0 0 0 8px rgba(46,213,115,0)}
@@ -999,9 +1096,10 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,sans-
 .top-pill{display:flex;align-items:center;gap:5px;background:var(--s2);border:1px solid var(--bd);border-radius:99px;padding:4px 10px;font-size:11px}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--rd);flex-shrink:0;transition:.3s}
 .dot.on{background:var(--gr);box-shadow:0 0 8px var(--gr);animation:blink 2s infinite}
+.dot.starting{background:var(--yw);box-shadow:0 0 8px var(--yw);animation:blink 1s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 .top-out{padding:6px 10px;border-radius:8px;border:1px solid rgba(240,82,82,.3);background:transparent;color:var(--rd);font-size:11px;cursor:pointer}
-.tabs{position:fixed;bottom:0;left:0;right:0;background:rgba(13,13,24,.97);backdrop-filter:blur(20px);border-top:1px solid var(--bd);display:grid;grid-template-columns:repeat(5,1fr);height:60px;z-index:200;padding-bottom:env(safe-area-inset-bottom)}
+.tabs{position:fixed;bottom:0;left:0;right:0;background:rgba(13,13,24,.97);backdrop-filter:blur(20px);border-top:1px solid var(--bd);display:grid;grid-template-columns:repeat(6,1fr);height:60px;z-index:200;padding-bottom:env(safe-area-inset-bottom)}
 .tab{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;cursor:pointer;border:none;background:transparent;color:var(--mu);transition:.15s;position:relative}
 .tab.active{color:var(--ac)}
 .tab .ti{font-size:22px;line-height:1}
@@ -1041,6 +1139,30 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,sans-
 .mon-badge.warn{background:rgba(240,180,41,.15);color:var(--yw)}
 .mon-badge.err{background:rgba(240,82,82,.15);color:var(--rd)}
 .mon-badge.off{background:rgba(90,90,128,.2);color:var(--mu)}
+
+/* ── HACKING-STYLE TERMINAL VIEW ── */
+.hack-term{background:#000;border:1px solid #1a3a1a;border-radius:12px;overflow:hidden;box-shadow:0 0 30px rgba(0,255,100,.08),inset 0 0 60px rgba(0,255,100,.03)}
+.hack-topbar{background:#0a0f0a;padding:8px 12px;display:flex;align-items:center;gap:6px;border-bottom:1px solid #1a3a1a}
+.hack-dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+.hack-dot.r{background:#ff5f56}.hack-dot.y{background:#ffbd2e}.hack-dot.g{background:#27c93f}
+.hack-title{margin-left:8px;font-family:'Courier New',monospace;font-size:11px;color:#5a8a5a}
+.hack-body{padding:16px;font-family:'Courier New',monospace;font-size:13px;line-height:2;color:#33ff66;text-shadow:0 0 6px rgba(51,255,102,.5)}
+.hack-line{white-space:normal;word-break:break-word}
+.hack-line b{color:#7fffb0;text-shadow:0 0 8px rgba(127,255,176,.7)}
+.hack-dim{color:#2a6a3a;text-shadow:none;font-size:11px}
+.hack-cmd{color:#9fffc0}
+.hack-cursor{display:inline-block;animation:hcblink 1s step-end infinite;color:#33ff66}
+@keyframes hcblink{0%,50%{opacity:1}51%,100%{opacity:0}}
+.hack-sep{border-top:1px dashed #1a3a1a;margin:10px 0}
+.hack-bar-row{margin:2px 0 12px}
+.hack-bar{height:8px;background:#0a1a0a;border:1px solid #1a3a1a;border-radius:2px;overflow:hidden}
+.hack-bar-fill{height:100%;transition:width .6s ease;box-shadow:0 0 10px currentColor}
+.hack-bar-fill.net{background:#33ffee;color:#33ffee}
+.hack-bar-fill.cpu{background:#ffd633;color:#ffd633}
+.hack-bar-fill.ram{background:#ff5566;color:#ff5566}
+.hack-blink-ok{color:#33ff66;animation:hcpulse 1.5s ease-in-out infinite}
+.hack-blink-bad{color:#ff5566 !important;text-shadow:0 0 8px rgba(255,85,102,.7) !important;animation:hcpulse 0.8s ease-in-out infinite}
+@keyframes hcpulse{0%,100%{opacity:1}50%{opacity:.5}}
 .btn{width:100%;padding:11px 8px;border-radius:12px;border:none;font-size:12px;font-weight:700;cursor:pointer;transition:.15s;display:flex;align-items:center;justify-content:center;gap:5px}
 .btn:active{transform:scale(.96)}
 .b-start{background:linear-gradient(135deg,#3ecf8e,#22d3ee);color:#000}
@@ -1072,13 +1194,17 @@ textarea.ci:focus{border-color:var(--ac)}
 .log-bar::-webkit-scrollbar{display:none}
 .lf{padding:5px 10px;border-radius:7px;border:1px solid var(--bd);background:transparent;color:var(--mu);font-size:11px;cursor:pointer;white-space:nowrap;transition:.15s}
 .lf.on{background:var(--ac);color:#fff;border-color:var(--ac)}
-.lbox{background:#020209;border:1px solid var(--bd);border-radius:12px;padding:10px;height:calc(100vh - 210px);overflow-y:auto;font-family:'Courier New',monospace;font-size:11px}
+.lbox{background:#0a0a12;border:1px solid var(--bd);border-radius:12px;padding:8px;height:calc(100vh - 210px);overflow-y:auto;font-family:'Courier New',monospace;font-size:11.5px}
+.le{display:flex;gap:7px;align-items:flex-start;padding:7px 8px;margin-bottom:4px;border-radius:8px;background:var(--s1);border-left:3px solid var(--bd);transition:.15s}
+.l-ic{flex-shrink:0;font-size:12px;line-height:1.5}
+.lt{color:var(--mu);white-space:nowrap;font-size:9.5px;flex-shrink:0;padding-top:2px;opacity:.75}
+.lx{word-break:normal;overflow-wrap:anywhere;line-height:1.55}
+.li{border-left-color:#3a4a6a}.li .lx{color:#9ca3af}
+.ls{border-left-color:var(--gr);background:rgba(62,207,142,.06)}.ls .lx{color:#7fe8ba}
+.lr{border-left-color:var(--rd);background:rgba(240,82,82,.08)}.lr .lx{color:#ff9b9b}
+.lw{border-left-color:var(--yw);background:rgba(240,180,41,.07)}.lw .lx{color:#ffd980}
 .lbox::-webkit-scrollbar{width:3px}
 .lbox::-webkit-scrollbar-thumb{background:var(--bd);border-radius:2px}
-.le{display:flex;gap:5px;padding:2px 0;line-height:1.6}
-.lt{color:var(--mu);white-space:nowrap;font-size:10px;flex-shrink:0}
-.lx{word-break:normal;overflow-wrap:anywhere;line-height:1.55}
-.li .lx{color:#9ca3af}.ls .lx{color:var(--gr)}.lr .lx{color:var(--rd)}.lw .lx{color:var(--yw)}
 .pathbar{background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:8px 12px;font-size:12px;color:var(--mu);margin-bottom:10px;overflow-x:auto;white-space:nowrap;display:flex;align-items:center;gap:4px}
 .pathbar::-webkit-scrollbar{display:none}
 .pp{color:var(--ac);cursor:pointer;font-weight:600}.pp:hover{text-decoration:underline}
@@ -1200,7 +1326,7 @@ textarea.ci:focus{border-color:var(--ac)}
     </div>
     <div class="tog-row">
       <div><div style="font-size:13px;font-weight:600">Auto Restart</div><div style="font-size:10px;color:var(--mu);margin-top:2px">Crash হলে অটো চালু</div></div>
-      <label class="tog"><input type="checkbox" id="arTog" onchange="toggleAR(this.checked)"><div class="tog-bg"></div><div class="tog-dot"></div></label>
+      <label class="tog"><input type="checkbox" id="arTog" checked disabled title="সবসময় ON থাকে"><div class="tog-bg"></div><div class="tog-dot"></div></label>
     </div>
   </div>
 
@@ -1214,6 +1340,13 @@ textarea.ci:focus{border-color:var(--ac)}
 <!-- LIVE MONITOR -->
 <div id="pg-monitor" class="page">
   <div class="pg-title">📊 লাইভ সিস্টেম মনিটর</div>
+
+  <div style="display:flex;gap:8px;margin-bottom:14px">
+    <button class="tbtn p" id="monViewNormal" onclick="setMonView('normal')" style="flex:1">📊 সাধারণ ভিউ</button>
+    <button class="tbtn" id="monViewHack" onclick="setMonView('hack')" style="flex:1">⚡ হ্যাকিং টার্মিনাল</button>
+  </div>
+
+  <div id="monNormalView">
 
   <!-- CARD ১: RAM / Render রিসোর্স -->
   <div class="mon-card">
@@ -1274,6 +1407,32 @@ textarea.ci:focus{border-color:var(--ac)}
       <div class="sc"><div class="sc-i">🕒</div><div class="sc-v" id="mLtUptime" style="font-size:14px">--</div><div class="sc-l">মোট সচল সময়</div></div>
     </div>
     <div class="mon-note" style="margin-top:12px">📅 ট্র্যাক করা হচ্ছে যবে থেকে: <b id="mLtSince">--</b><br>ℹ️ এই সংখ্যাগুলো প্যানেল বা বট যতবারই restart হোক না কেন কখনো শূন্য হয়ে যায় না — MongoDB-তে স্থায়ীভাবে জমা থাকে।</div>
+  </div>
+  </div>
+
+  <div id="monHackView" style="display:none">
+    <div class="hack-term">
+      <div class="hack-topbar"><span class="hack-dot r"></span><span class="hack-dot y"></span><span class="hack-dot g"></span><span class="hack-title">root@belal-bot:~# system_monitor.sh</span></div>
+      <div class="hack-body">
+        <div class="hack-line">$ <span class="hack-cmd">initializing live diagnostics</span><span class="hack-cursor">▋</span></div>
+        <div class="hack-line hack-dim">[<span id="hkTime">--:--:--</span>] connection established ✓</div>
+        <div class="hack-sep"></div>
+
+        <div class="hack-line">🌐 NETWORK ⬇ <b id="hkRx">0.0</b> KB/s &nbsp; ⬆ <b id="hkTx">0.0</b> KB/s</div>
+        <div class="hack-bar-row"><div class="hack-bar"><div class="hack-bar-fill net" id="hkNetBar" style="width:0%"></div></div></div>
+
+        <div class="hack-line">🧠 CPU LOAD <b id="hkCpu">0</b>%</div>
+        <div class="hack-bar-row"><div class="hack-bar"><div class="hack-bar-fill cpu" id="hkCpuBar" style="width:0%"></div></div></div>
+
+        <div class="hack-line">💾 RAM USAGE <b id="hkRam">0</b>% <span class="hack-dim">(512MB সীমা)</span></div>
+        <div class="hack-bar-row"><div class="hack-bar"><div class="hack-bar-fill ram" id="hkRamBar" style="width:0%"></div></div></div>
+
+        <div class="hack-sep"></div>
+        <div class="hack-line">⬇️ ACTIVE DOWNLOADS: <b id="hkHeavy">0/2</b></div>
+        <div class="hack-line">🤖 BOT STATUS: <b id="hkBotStatus" class="hack-blink-ok">SCANNING...</b></div>
+        <div class="hack-line hack-dim">> _</div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1410,7 +1569,7 @@ textarea.ci:focus{border-color:var(--ac)}
     <div class="set-title">🔧 Settings</div>
     <div class="set-row"><div><div class="sr-l">Panel নাম</div></div><input class="sinp" type="text" id="sName" placeholder="${pname}"></div>
     <div class="set-row"><div><div class="sr-l">Site URL</div><div class="sr-s">ঘুম বন্ধের জন্য</div></div><input class="sinp" type="text" id="sSiteUrl" placeholder="https://xxx.onrender.com"></div>
-    <div class="set-row"><div><div class="sr-l">Auto Restart</div><div class="sr-s">Crash হলে অটো</div></div><label class="tog"><input type="checkbox" id="sAR" onchange="toggleAR(this.checked)"><div class="tog-bg"></div><div class="tog-dot"></div></label></div>
+    <div class="set-row"><div><div class="sr-l">Auto Restart</div><div class="sr-s">সবসময় ON থাকে (বন্ধ করা যায় না)</div></div><label class="tog"><input type="checkbox" id="sAR" checked disabled title="সবসময় ON থাকে"><div class="tog-bg"></div><div class="tog-dot"></div></label></div>
     <div class="set-row"><div><div class="sr-l">Schedule Restart</div><div class="sr-s">প্রতিদিন নির্দিষ্ট সময়ে</div></div><label class="tog"><input type="checkbox" id="sSched"><div class="tog-bg"></div><div class="tog-dot"></div></label></div>
     <div class="set-row"><div><div class="sr-l">Restart সময়</div></div><input class="sinp" type="time" id="sTime" value="03:00"></div>
     <div style="margin-top:12px"><button class="tbtn p" onclick="saveSettings()">💾 সেভ</button></div>
@@ -1465,11 +1624,12 @@ function goTab(id,btn){
   btn.classList.add("active");
   document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));
   document.getElementById("pg-"+id).classList.add("active");
+  if(id!=="monitor"){ clearInterval(_hackTimer); }
   if(id==="files") loadFiles(curDir);
   if(id==="more"){loadEnv();loadSettings();}
   if(id==="logs") document.getElementById("lbox").scrollTop=document.getElementById("lbox").scrollHeight;
   if(id==="upload"){document.getElementById("uploadDir").textContent=curDir||"root";}
-  if(id==="monitor") loadMonitor();
+  if(id==="monitor") setMonView(_monView||"normal");
 }
 
 // WS
@@ -1480,7 +1640,7 @@ function connectWS(){
     const m=JSON.parse(e.data);
     if(m.type==="log") appendLog(m.data);
     if(m.type==="logs"){document.getElementById("lbox").innerHTML="";m.data.forEach(appendLog);}
-    if(m.type==="status") updateStatus(m.running);
+    if(m.type==="status") updateStatus(m.running,m.starting);
     if(m.type==="clearLogs") document.getElementById("lbox").innerHTML="";
     if(m.type==="mongo") updateMongo(m.connected);
   };
@@ -1492,8 +1652,9 @@ function appendLog(e){
   const box=document.getElementById("lbox");
   const d=document.createElement("div");
   const cls={info:"li",success:"ls",error:"lr",warn:"lw"}[e.type||"info"]||"li";
+  const icon={info:"ℹ️",success:"✅",error:"❌",warn:"⚠️"}[e.type||"info"]||"ℹ️";
   d.className="le "+cls;d.dataset.t=e.type||"info";
-  d.innerHTML='<span class="lt">'+e.time+'</span><span class="lx">'+esc(e.text)+'</span>';
+  d.innerHTML='<span class="l-ic">'+icon+'</span><span class="lt">'+e.time+'</span><span class="lx">'+esc(e.text)+'</span>';
   box.appendChild(d);
   if(autoScroll) box.scrollTop=box.scrollHeight;
 }
@@ -1503,13 +1664,16 @@ function setLF(f,btn){logFilter=f;document.querySelectorAll(".lf").forEach(b=>b.
 function clearLogs(){fetch("/api/bot/clearlogs",{method:"POST"});}
 function clearLogFile(){if(!confirm("Log file মুছবেন?"))return;fetch("/api/bot/clearlogfile",{method:"POST"}).then(r=>r.json()).then(d=>toast(d.ok?"✅ মুছা হয়েছে":"❌ ব্যর্থ",d.ok?"success":"error"));}
 
-function updateStatus(running){
+function updateStatus(running,starting){
   _botRunning=running;
   if(!running) _botUpSec=0;
-  [document.getElementById("sDot"),document.getElementById("tDot")].forEach(d=>{if(d)d.className="dot"+(running?" on":"");});
-  const tLogo=document.getElementById("topLogo");if(tLogo)tLogo.className="top-logo"+(running?" live":"");
-  const st=document.getElementById("sTxt");if(st)st.textContent=running?"✅ বট চলছে":"🔴 বট বন্ধ";
-  const ts=document.getElementById("tStatus");if(ts)ts.textContent=running?"✅ চলছে":"🔴 বন্ধ";
+  const state = running?"ready":(starting?"starting":"stopped");
+  [document.getElementById("sDot"),document.getElementById("tDot")].forEach(d=>{if(d)d.className="dot"+(running?" on":(starting?" starting":""));});
+  const tLogo=document.getElementById("topLogo");if(tLogo)tLogo.className="top-logo"+(running?" live":(starting?" starting":""));
+  const texts={ready:"✅ বট চলছে",starting:"🟡 বট চালু হচ্ছে...",stopped:"🔴 বট বন্ধ"};
+  const textsShort={ready:"✅ চলছে",starting:"🟡 চালু হচ্ছে",stopped:"🔴 বন্ধ"};
+  const st=document.getElementById("sTxt");if(st)st.textContent=texts[state];
+  const ts=document.getElementById("tStatus");if(ts)ts.textContent=textsShort[state];
 }
 
 function updateMongo(connected){
@@ -1564,7 +1728,7 @@ async function refresh(){
     const cc=document.getElementById("cCrash");if(cc)cc.textContent=st.crashes||0;
     const ct=document.getElementById("cTup");if(ct)ct.textContent=fmtT((st.totalUptime||0)+(bs.uptime||0));
     const cn=document.getElementById("cNode");if(cn)cn.textContent=(st.node||"").replace("v","");
-    updateStatus(bs.running);
+    updateStatus(!!bs.ready, bs.running && !bs.ready);
     updateMongo(st.mongoConnected||false);
     fetch("/api/cookie/status").then(r=>r.json()).then(cs=>{
       const el=document.getElementById("cookieStatus");if(!el)return;
@@ -1577,12 +1741,48 @@ async function refresh(){
     const hl=document.getElementById("histList");
     if(hl)hl.innerHTML=hist.length?hist.map(h=>'<div class="hi"><span class="hi-date">'+new Date(h.date).toLocaleString("bn-BD").substring(0,16)+'</span><span class="hi-up">'+fmtT(h.uptime)+'</span><span class="hi-code">'+h.code+'</span></div>').join(""):'<div style="font-size:12px;color:var(--mu);text-align:center;padding:10px">ইতিহাস নেই</div>';
     const pgMon=document.getElementById("pg-monitor");
-    if(pgMon&&pgMon.classList.contains("active")) loadMonitor();
+    if(pgMon&&pgMon.classList.contains("active")&&_monView!=="hack") loadMonitor();
   }catch{}
 }
 
 // LIVE MONITOR
 function _mColor(pct){ return pct<60?"var(--gr)":pct<85?"var(--yw)":"var(--rd)"; }
+let _monView="normal", _hackTimer=null;
+function setMonView(view){
+  _monView=view;
+  document.getElementById("monNormalView").style.display = view==="normal"?"block":"none";
+  document.getElementById("monHackView").style.display = view==="hack"?"block":"none";
+  document.getElementById("monViewNormal").className = "tbtn"+(view==="normal"?" p":"");
+  document.getElementById("monViewHack").className = "tbtn"+(view==="hack"?" p":"");
+  clearInterval(_hackTimer);
+  if(view==="hack"){ loadTerminal(); _hackTimer=setInterval(loadTerminal,2000); }
+  else loadMonitor();
+}
+async function loadTerminal(){
+  try{
+    const d=await fetch("/api/system/terminal").then(r=>r.json());
+    const now=new Date();
+    document.getElementById("hkTime").textContent=now.toLocaleTimeString("en-GB");
+    if(d.net){
+      document.getElementById("hkRx").textContent=(d.net.rxKBs??0).toFixed(1);
+      document.getElementById("hkTx").textContent=(d.net.txKBs??0).toFixed(1);
+      const netPct=Math.min(100,Math.round(((d.net.rxKBs||0)+(d.net.txKBs||0))/2)); // মোটামুটি ভিজ্যুয়াল স্কেল, ২০০KB/s ধরে
+      document.getElementById("hkNetBar").style.width=netPct+"%";
+    }
+    document.getElementById("hkCpu").textContent=d.cpuPercent??0;
+    document.getElementById("hkCpuBar").style.width=(d.cpuPercent??0)+"%";
+    document.getElementById("hkRam").textContent=d.ramPercent??0;
+    document.getElementById("hkRamBar").style.width=(d.ramPercent??0)+"%";
+    const hv=document.getElementById("hkHeavy");
+    if(hv) hv.textContent=d.heavy?(d.heavy.active+"/"+d.heavy.max):"0/2";
+    const bs=document.getElementById("hkBotStatus");
+    if(bs){
+      if(d.botReady){ bs.textContent="ONLINE ✓"; bs.className="hack-blink-ok"; }
+      else if(d.botRunning){ bs.textContent="BOOTING..."; bs.className="hack-blink-ok"; }
+      else { bs.textContent="OFFLINE ✕"; bs.className="hack-blink-bad"; }
+    }
+  }catch(e){}
+}
 async function loadMonitor(){
   try{
     const d=await fetch("/api/system/live").then(r=>r.json());

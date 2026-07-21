@@ -278,7 +278,7 @@ const auth = (req,res,next) => req.session.ok ? next() : res.redirect("/login");
 const safe = (base,rel) => { const f=path.resolve(base,rel||""); if(!f.startsWith(path.resolve(base))) throw new Error("Access denied"); return f; };
 
 // ── BOT ──
-let botProc=null, botLogs=[], botStart=null, botReady=false, autoRestart=true, rsTimer=null, _consecutiveCrashes=0; // ── Auto-Restart সবসময় ON থাকবে (ইউজারের সিদ্ধান্ত অনুযায়ী) — বন্ধ করার অপশন সরিয়ে দেওয়া হয়েছে
+let botProc=null, botLogs=[], botStart=null, botReady=false, autoRestart=true, rsTimer=null, _consecutiveCrashes=0, _installInProgress=false; // ── Auto-Restart সবসময় ON থাকবে (ইউজারের সিদ্ধান্ত অনুযায়ী) — বন্ধ করার অপশন সরিয়ে দেওয়া হয়েছে
 
 function bc(d){wss.clients.forEach(c=>{if(c.readyState===WebSocket.OPEN)c.send(JSON.stringify(d));});}
 
@@ -313,6 +313,7 @@ async function getShouldRun(){
 
 function startBot(by="manual"){
   if(botProc) return {ok:false,msg:"বট ইতিমধ্যে চলছে"};
+  if(_installInProgress) return {ok:false,msg:"📦 npm install ইতিমধ্যে ব্যাকগ্রাউন্ডে চলছে — শেষ হওয়া পর্যন্ত অপেক্ষা করো"};
   const idx=["index.js","app.js","main.js","bot.js","start.js"].find(f=>fs.existsSync(path.join(BDIR,f)));
   if(!idx) return {ok:false,msg:"index.js পাওয়া যায়নি — বট আপলোড করুন"};
   const nmDir=path.join(BDIR,"node_modules");
@@ -369,22 +370,42 @@ function startBot(by="manual"){
     // ⚠️ আগে এখানে execSync ব্যবহার হতো, যেটা npm install শেষ না হওয়া পর্যন্ত
     // পুরো ওয়েবসাইটকেই (Express সার্ভার) ফ্রিজ করে রাখত — এখন async spawn,
     // তাই ওয়েবসাইট npm install চলাকালীনও স্বাভাবিকভাবে খোলা/ব্যবহার করা যাবে
-    log("📦 npm install চলছে (ব্যাকগ্রাউন্ডে — ওয়েবসাইট এখনো স্বাভাবিকভাবে খোলা যাবে)...","warn");
+    _installInProgress = true;
+    const ramBefore = Math.round(process.memoryUsage().rss/1024/1024);
+    log(`📦 npm install শুরু — ব্যাকগ্রাউন্ডে (এই মুহূর্তে RAM: ${ramBefore}MB)`,"warn");
     bc({type:"status",running:false,installing:true});
-    const npmProc = spawn(process.platform==="win32"?"npm.cmd":"npm", ["install","--no-audit","--no-fund"], {cwd:BDIR});
-    let npmErr="";
-    npmProc.stderr.on("data",d=>{npmErr+=d.toString();});
+    const npmProc = spawn(process.platform==="win32"?"npm.cmd":"npm", ["install","--omit=dev","--no-audit","--no-fund","--prefer-offline"], {cwd:BDIR});
+    let npmErr="", npmBuf="";
+    const flushLine=(s)=>{
+      npmBuf += s;
+      let i;
+      while((i=npmBuf.indexOf("\n"))>=0){
+        const line=npmBuf.slice(0,i).trim(); npmBuf=npmBuf.slice(i+1);
+        if(line) log("📦 "+line,"info");
+      }
+    };
+    npmProc.stdout.on("data",d=>flushLine(d.toString()));
+    npmProc.stderr.on("data",d=>{const s=d.toString();npmErr+=s;flushLine(s);});
+    // ── নিরাপত্তা: npm install যদি কোনো কারণে ৫ মিনিটেও শেষ না হয় (ঝুলে যায়),
+    // জোর করে বন্ধ করে lock ছেড়ে দেওয়া হবে — যাতে সিস্টেম চিরস্থায়ীভাবে আটকে না থাকে
+    const hangGuard = setTimeout(()=>{
+      log("⚠️ npm install ৫ মিনিটেও শেষ হয়নি — জোর করে বন্ধ করা হলো","error");
+      try{ npmProc.kill("SIGKILL"); }catch{}
+    }, 5*60*1000);
     npmProc.on("exit",(code)=>{
+      clearTimeout(hangGuard);
+      _installInProgress = false;
+      const ramAfter = Math.round(process.memoryUsage().rss/1024/1024);
       if(code===0){
-        log("✅ npm install সম্পন্ন","success");
+        log(`✅ npm install সম্পন্ন — সব প্যাকেজ ইনস্টল হয়েছে (RAM এখন: ${ramAfter}MB)`,"success");
         actuallySpawnBot();
       } else {
-        log("⚠️ npm install ব্যর্থ (code "+code+"): "+npmErr.slice(-300),"error");
+        log(`⚠️ npm install ব্যর্থ (code ${code}, RAM এখন: ${ramAfter}MB): `+npmErr.slice(-300),"error");
         sendPush("⚠️ npm install ব্যর্থ", "বট চালু করা যায়নি — dependency install fail করেছে। প্যানেলের লগ দেখো।", {priority:"high", tags:"warning"});
         bc({type:"status",running:false});
       }
     });
-    npmProc.on("error",(e)=>{ log("⚠️ npm install চালু করতে ব্যর্থ: "+e.message,"error"); });
+    npmProc.on("error",(e)=>{ clearTimeout(hangGuard); _installInProgress=false; log("⚠️ npm install চালু করতে ব্যর্থ: "+e.message,"error"); });
     return {ok:true,msg:"📦 npm install ব্যাকগ্রাউন্ডে শুরু হয়েছে — একটু পর বট নিজে থেকেই চালু হয়ে যাবে, ওয়েবসাইট এখনই স্বাভাবিকভাবে ব্যবহার করা যাবে"};
   }
 
@@ -476,14 +497,21 @@ app.get("/api/bot/logs",     auth,(req,res)=>res.json({logs:botLogs}));
 app.post("/api/bot/clearlogs",auth,(req,res)=>{botLogs=[];bc({type:"clearLogs"});res.json({ok:true});});
 app.post("/api/bot/install", auth,(req,res)=>{
   if(!fs.existsSync(path.join(BDIR,"package.json"))) return res.json({ok:false,msg:"package.json নেই"});
-  log("📦 npm install চলছে (ব্যাকগ্রাউন্ডে)...","warn");
-  const npmProc = spawn(process.platform==="win32"?"npm.cmd":"npm", ["install","--no-audit","--no-fund"], {cwd:BDIR});
-  let npmErr="";
-  npmProc.stderr.on("data",d=>{npmErr+=d.toString();});
+  if(_installInProgress) return res.json({ok:false,msg:"📦 npm install ইতিমধ্যে চলছে"});
+  _installInProgress = true;
+  log("📦 npm install শুরু (ম্যানুয়াল, ব্যাকগ্রাউন্ডে)...","warn");
+  const npmProc = spawn(process.platform==="win32"?"npm.cmd":"npm", ["install","--omit=dev","--no-audit","--no-fund","--prefer-offline"], {cwd:BDIR});
+  let npmErr="", npmBuf="";
+  const flushLine=(s)=>{npmBuf+=s;let i;while((i=npmBuf.indexOf("\n"))>=0){const line=npmBuf.slice(0,i).trim();npmBuf=npmBuf.slice(i+1);if(line)log("📦 "+line,"info");}};
+  npmProc.stdout.on("data",d=>flushLine(d.toString()));
+  npmProc.stderr.on("data",d=>{const s=d.toString();npmErr+=s;flushLine(s);});
+  const hangGuard=setTimeout(()=>{log("⚠️ npm install ৫ মিনিটেও শেষ হয়নি — বন্ধ করা হলো","error");try{npmProc.kill("SIGKILL");}catch{}},5*60*1000);
   npmProc.on("exit",(code)=>{
+    clearTimeout(hangGuard); _installInProgress=false;
     if(code===0) log("✅ npm install সম্পন্ন","success");
     else log("❌ npm install ব্যর্থ: "+npmErr.slice(-300),"error");
   });
+  npmProc.on("error",(e)=>{clearTimeout(hangGuard);_installInProgress=false;log("⚠️ npm install চালু করতে ব্যর্থ: "+e.message,"error");});
   res.json({ok:true,msg:"📦 npm install ব্যাকগ্রাউন্ডে শুরু হয়েছে — লগে অগ্রগতি দেখতে পারবে"});
 });
 app.post("/api/bot/autorestart",auth,(req,res)=>{autoRestart=true;cfg.autoRestart=true;saveJ(CFG,cfg);res.json({ok:true,enabled:true,note:"Auto-Restart সবসময় ON থাকে, বন্ধ করা যায় না"});});
@@ -579,7 +607,9 @@ app.get("/api/system/terminal",auth,(req,res)=>{
     net,
     cpuPercent: getCpuPercent(),
     ramPercent: Math.min(100, Math.round(((botMB||0)+panelMB)/512*100)),
-    botRunning: !!botProc, botReady, heavy: getHeavyStatus()
+    botRunning: !!botProc, botReady, heavy: getHeavyStatus(),
+    uptimeSec: botStart?Math.floor((Date.now()-botStart)/1000):0,
+    tail: botLogs.slice(-6).map(l=>({time:l.time,text:l.text,type:l.type}))
   });
 });
 
@@ -1099,11 +1129,11 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,sans-
 .dot.starting{background:var(--yw);box-shadow:0 0 8px var(--yw);animation:blink 1s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 .top-out{padding:6px 10px;border-radius:8px;border:1px solid rgba(240,82,82,.3);background:transparent;color:var(--rd);font-size:11px;cursor:pointer}
-.tabs{position:fixed;bottom:0;left:0;right:0;background:rgba(13,13,24,.97);backdrop-filter:blur(20px);border-top:1px solid var(--bd);display:grid;grid-template-columns:repeat(6,1fr);height:60px;z-index:200;padding-bottom:env(safe-area-inset-bottom)}
+.tabs{position:fixed;bottom:0;left:0;right:0;background:rgba(13,13,24,.97);backdrop-filter:blur(20px);border-top:1px solid var(--bd);display:grid;grid-template-columns:repeat(7,1fr);height:60px;z-index:200;padding-bottom:env(safe-area-inset-bottom)}
 .tab{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;cursor:pointer;border:none;background:transparent;color:var(--mu);transition:.15s;position:relative}
 .tab.active{color:var(--ac)}
-.tab .ti{font-size:22px;line-height:1}
-.tab .tl{font-size:9px;font-weight:700}
+.tab .ti{font-size:19px;line-height:1}
+.tab .tl{font-size:8px;font-weight:700}
 .tab::after{content:"";position:absolute;top:0;left:50%;transform:translateX(-50%);width:0;height:2px;background:var(--ac);border-radius:0 0 3px 3px;transition:.2s}
 .tab.active::after{width:40px}
 .main{padding:66px 12px 72px;min-height:100vh}
@@ -1163,6 +1193,18 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,sans-
 .hack-blink-ok{color:#33ff66;animation:hcpulse 1.5s ease-in-out infinite}
 .hack-blink-bad{color:#ff5566 !important;text-shadow:0 0 8px rgba(255,85,102,.7) !important;animation:hcpulse 0.8s ease-in-out infinite}
 @keyframes hcpulse{0%,100%{opacity:1}50%{opacity:.5}}
+.hack-ok{color:#7fffb0;text-shadow:0 0 6px rgba(127,255,176,.6)}
+.hack-tail-info{color:#5fae7a}
+.hack-tail-success{color:#7fffb0}
+.hack-tail-error{color:#ff8080}
+.hack-tail-warn{color:#ffd633}
+.hack-glitch{position:relative;font-size:20px;font-weight:900;letter-spacing:2px;color:#33ff66;text-shadow:0 0 10px rgba(51,255,102,.7);margin-bottom:10px;animation:hglitch 3.5s infinite}
+.hack-glitch::before,.hack-glitch::after{content:attr(data-text);position:absolute;left:0;top:0;width:100%;overflow:hidden}
+.hack-glitch::before{color:#ff33aa;animation:hglitch1 2.5s infinite;clip-path:inset(0 0 60% 0)}
+.hack-glitch::after{color:#33ccff;animation:hglitch2 3s infinite;clip-path:inset(60% 0 0 0)}
+@keyframes hglitch{0%,93%,100%{transform:translate(0)}94%{transform:translate(-2px,1px)}96%{transform:translate(2px,-1px)}}
+@keyframes hglitch1{0%,93%,100%{transform:translate(0)}94%{transform:translate(2px,-1px)}96%{transform:translate(-2px,1px)}}
+@keyframes hglitch2{0%,93%,100%{transform:translate(0)}94%{transform:translate(-3px,0)}96%{transform:translate(3px,0)}}
 .btn{width:100%;padding:11px 8px;border-radius:12px;border:none;font-size:12px;font-weight:700;cursor:pointer;transition:.15s;display:flex;align-items:center;justify-content:center;gap:5px}
 .btn:active{transform:scale(.96)}
 .b-start{background:linear-gradient(135deg,#3ecf8e,#22d3ee);color:#000}
@@ -1341,13 +1383,6 @@ textarea.ci:focus{border-color:var(--ac)}
 <div id="pg-monitor" class="page">
   <div class="pg-title">📊 লাইভ সিস্টেম মনিটর</div>
 
-  <div style="display:flex;gap:8px;margin-bottom:14px">
-    <button class="tbtn p" id="monViewNormal" onclick="setMonView('normal')" style="flex:1">📊 সাধারণ ভিউ</button>
-    <button class="tbtn" id="monViewHack" onclick="setMonView('hack')" style="flex:1">⚡ হ্যাকিং টার্মিনাল</button>
-  </div>
-
-  <div id="monNormalView">
-
   <!-- CARD ১: RAM / Render রিসোর্স -->
   <div class="mon-card">
     <div class="mon-head">🖥️ RAM ব্যবহার <span class="mon-badge off">সীমা ৫১২MB</span></div>
@@ -1408,35 +1443,41 @@ textarea.ci:focus{border-color:var(--ac)}
     </div>
     <div class="mon-note" style="margin-top:12px">📅 ট্র্যাক করা হচ্ছে যবে থেকে: <b id="mLtSince">--</b><br>ℹ️ এই সংখ্যাগুলো প্যানেল বা বট যতবারই restart হোক না কেন কখনো শূন্য হয়ে যায় না — MongoDB-তে স্থায়ীভাবে জমা থাকে।</div>
   </div>
-  </div>
+</div>
 
-  <div id="monHackView" style="display:none">
-    <div class="hack-term">
-      <div class="hack-topbar"><span class="hack-dot r"></span><span class="hack-dot y"></span><span class="hack-dot g"></span><span class="hack-title">root@belal-bot:~# system_monitor.sh</span></div>
-      <div class="hack-body">
-        <div class="hack-line">$ <span class="hack-cmd">initializing live diagnostics</span><span class="hack-cursor">▋</span></div>
-        <div class="hack-line hack-dim">[<span id="hkTime">--:--:--</span>] connection established ✓</div>
-        <div class="hack-sep"></div>
+<!-- TERMINAL (হ্যাকিং স্টাইল, আলাদা ট্যাব) -->
+<div id="pg-term" class="page">
+  <div class="hack-term">
+    <div class="hack-topbar"><span class="hack-dot r"></span><span class="hack-dot y"></span><span class="hack-dot g"></span><span class="hack-title">root@belal-bot:~# system_monitor.sh</span></div>
+    <div class="hack-body">
+      <div class="hack-glitch" data-text="BELAL BOTX666-MAX">BELAL BOTX666-MAX</div>
+      <div class="hack-line hack-dim">[<span id="hkTime">--:--:--</span>] secure connection established ✓</div>
+      <div class="hack-line hack-dim">[BOOT] kernel modules ... <span class="hack-ok">OK</span></div>
+      <div class="hack-line hack-dim">[BOOT] mongo link ......... <span class="hack-ok">OK</span></div>
+      <div class="hack-line hack-dim">[BOOT] ipc channel ........ <span class="hack-ok">OK</span></div>
+      <div class="hack-sep"></div>
 
-        <div class="hack-line">🌐 NETWORK ⬇ <b id="hkRx">0.0</b> KB/s &nbsp; ⬆ <b id="hkTx">0.0</b> KB/s</div>
-        <div class="hack-bar-row"><div class="hack-bar"><div class="hack-bar-fill net" id="hkNetBar" style="width:0%"></div></div></div>
+      <div class="hack-line">🌐 NETWORK ⬇ <b id="hkRx">0.0</b> KB/s &nbsp; ⬆ <b id="hkTx">0.0</b> KB/s</div>
+      <div class="hack-bar-row"><div class="hack-bar"><div class="hack-bar-fill net" id="hkNetBar" style="width:0%"></div></div></div>
 
-        <div class="hack-line">🧠 CPU LOAD <b id="hkCpu">0</b>%</div>
-        <div class="hack-bar-row"><div class="hack-bar"><div class="hack-bar-fill cpu" id="hkCpuBar" style="width:0%"></div></div></div>
+      <div class="hack-line">🧠 CPU LOAD <b id="hkCpu">0</b>%</div>
+      <div class="hack-bar-row"><div class="hack-bar"><div class="hack-bar-fill cpu" id="hkCpuBar" style="width:0%"></div></div></div>
 
-        <div class="hack-line">💾 RAM USAGE <b id="hkRam">0</b>% <span class="hack-dim">(512MB সীমা)</span></div>
-        <div class="hack-bar-row"><div class="hack-bar"><div class="hack-bar-fill ram" id="hkRamBar" style="width:0%"></div></div></div>
+      <div class="hack-line">💾 RAM USAGE <b id="hkRam">0</b>% <span class="hack-dim">(512MB সীমা)</span></div>
+      <div class="hack-bar-row"><div class="hack-bar"><div class="hack-bar-fill ram" id="hkRamBar" style="width:0%"></div></div></div>
 
-        <div class="hack-sep"></div>
-        <div class="hack-line">⬇️ ACTIVE DOWNLOADS: <b id="hkHeavy">0/2</b></div>
-        <div class="hack-line">🤖 BOT STATUS: <b id="hkBotStatus" class="hack-blink-ok">SCANNING...</b></div>
-        <div class="hack-line hack-dim">> _</div>
-      </div>
+      <div class="hack-sep"></div>
+      <div class="hack-line">⬇️ ACTIVE DOWNLOADS: <b id="hkHeavy">0/2</b></div>
+      <div class="hack-line">🤖 BOT STATUS: <b id="hkBotStatus" class="hack-blink-ok">SCANNING...</b></div>
+      <div class="hack-line">⏱️ UPTIME: <b id="hkUptime">00:00:00</b></div>
+      <div class="hack-sep"></div>
+
+      <div class="hack-line hack-dim">$ tail -f live.log</div>
+      <div id="hkTail"></div>
+      <div class="hack-line hack-dim">> <span class="hack-cursor">▋</span></div>
     </div>
   </div>
 </div>
-
-<!-- LOGS -->
 <div id="pg-logs" class="page">
   <div class="log-bar">
     <button class="lf on" onclick="setLF('all',this)">📋 সব</button>
@@ -1600,6 +1641,7 @@ textarea.ci:focus{border-color:var(--ac)}
 <div class="tabs">
   <button class="tab active" onclick="goTab('home',this)"><span class="ti">🏠</span><span class="tl">হোম</span></button>
   <button class="tab" onclick="goTab('monitor',this)"><span class="ti">📊</span><span class="tl">মনিটর</span></button>
+  <button class="tab" onclick="goTab('term',this)"><span class="ti">⚡</span><span class="tl">টার্মিনাল</span></button>
   <button class="tab" onclick="goTab('logs',this)"><span class="ti">📋</span><span class="tl">লগ</span></button>
   <button class="tab" onclick="goTab('files',this)"><span class="ti">📁</span><span class="tl">ফাইল</span></button>
   <button class="tab" onclick="goTab('upload',this)"><span class="ti">⬆️</span><span class="tl">আপলোড</span></button>
@@ -1624,12 +1666,13 @@ function goTab(id,btn){
   btn.classList.add("active");
   document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));
   document.getElementById("pg-"+id).classList.add("active");
-  if(id!=="monitor"){ clearInterval(_hackTimer); }
+  if(id!=="term"){ clearInterval(_hackTimer); }
   if(id==="files") loadFiles(curDir);
   if(id==="more"){loadEnv();loadSettings();}
   if(id==="logs") document.getElementById("lbox").scrollTop=document.getElementById("lbox").scrollHeight;
   if(id==="upload"){document.getElementById("uploadDir").textContent=curDir||"root";}
-  if(id==="monitor") setMonView(_monView||"normal");
+  if(id==="monitor") loadMonitor();
+  if(id==="term"){ loadTerminal(); _hackTimer=setInterval(loadTerminal,1500); }
 }
 
 // WS
@@ -1741,23 +1784,13 @@ async function refresh(){
     const hl=document.getElementById("histList");
     if(hl)hl.innerHTML=hist.length?hist.map(h=>'<div class="hi"><span class="hi-date">'+new Date(h.date).toLocaleString("bn-BD").substring(0,16)+'</span><span class="hi-up">'+fmtT(h.uptime)+'</span><span class="hi-code">'+h.code+'</span></div>').join(""):'<div style="font-size:12px;color:var(--mu);text-align:center;padding:10px">ইতিহাস নেই</div>';
     const pgMon=document.getElementById("pg-monitor");
-    if(pgMon&&pgMon.classList.contains("active")&&_monView!=="hack") loadMonitor();
+    if(pgMon&&pgMon.classList.contains("active")) loadMonitor();
   }catch{}
 }
 
 // LIVE MONITOR
 function _mColor(pct){ return pct<60?"var(--gr)":pct<85?"var(--yw)":"var(--rd)"; }
-let _monView="normal", _hackTimer=null;
-function setMonView(view){
-  _monView=view;
-  document.getElementById("monNormalView").style.display = view==="normal"?"block":"none";
-  document.getElementById("monHackView").style.display = view==="hack"?"block":"none";
-  document.getElementById("monViewNormal").className = "tbtn"+(view==="normal"?" p":"");
-  document.getElementById("monViewHack").className = "tbtn"+(view==="hack"?" p":"");
-  clearInterval(_hackTimer);
-  if(view==="hack"){ loadTerminal(); _hackTimer=setInterval(loadTerminal,2000); }
-  else loadMonitor();
-}
+let _hackTimer=null, _hackTailShown=new Set();
 async function loadTerminal(){
   try{
     const d=await fetch("/api/system/terminal").then(r=>r.json());
@@ -1775,11 +1808,16 @@ async function loadTerminal(){
     document.getElementById("hkRamBar").style.width=(d.ramPercent??0)+"%";
     const hv=document.getElementById("hkHeavy");
     if(hv) hv.textContent=d.heavy?(d.heavy.active+"/"+d.heavy.max):"0/2";
+    if(d.uptimeSec!=null){ document.getElementById("hkUptime").textContent=fmtT(d.uptimeSec); }
     const bs=document.getElementById("hkBotStatus");
     if(bs){
       if(d.botReady){ bs.textContent="ONLINE ✓"; bs.className="hack-blink-ok"; }
       else if(d.botRunning){ bs.textContent="BOOTING..."; bs.className="hack-blink-ok"; }
       else { bs.textContent="OFFLINE ✕"; bs.className="hack-blink-bad"; }
+    }
+    const tailBox=document.getElementById("hkTail");
+    if(tailBox && d.tail){
+      tailBox.innerHTML = d.tail.map(l=>'<div class="hack-line hack-tail-'+(l.type||"info")+'">['+l.time+'] '+esc(l.text)+'</div>').join("");
     }
   }catch(e){}
 }

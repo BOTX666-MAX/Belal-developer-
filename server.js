@@ -31,6 +31,7 @@ const BDIR  = path.join(__dirname, "bot");
 const LFILE = path.join(__dirname, "panel.log");
 const SFILE = path.join(__dirname, "stats.json");
 const LTFILE = path.join(__dirname, "lifetime.json"); // panel/bot RAM + mongo ব্যবহারের সর্বকালীন উচ্চতম (lifetime peak) — MongoDB-তেও ব্যাকআপ থাকে, তাই panel restart হলেও হারায় না
+const AFILE = path.join(__dirname, "alerts.json"); // ইন-প্যানেল লাইফটাইম অ্যালার্ট/নোটিফিকেশন হিস্ট্রি — MongoDB-তেও ব্যাকআপ থাকে
 const PORT  = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGODB_URI || "mongodb+srv://belal:belal123456@cluster0.i1wofni.mongodb.net/botpanel?appName=Cluster0";
 
@@ -43,29 +44,31 @@ let lifetime = loadJ(LTFILE,{peakPanelMB:0,peakBotMB:0,peakMongoMB:0,firstSeen:n
 const PASS = process.env.PANEL_PASSWORD || cfg.password || "admin123";
 if(!fs.existsSync(BDIR)) fs.mkdirSync(BDIR,{recursive:true});
 
-// ── ফোনে লাইভ পুশ নোটিফিকেশন (ntfy.sh — ফ্রি, সাইনআপ লাগে না) ──
-// প্রথমবার একটা ইউনিক টপিক বানানো হচ্ছে, স্থায়ীভাবে সেভ থাকবে — একবার ntfy অ্যাপে সাবস্ক্রাইব করলেই সব নোটিফিকেশন সরাসরি ফোনে চলে আসবে
-if(!cfg.ntfyTopic){
-  cfg.ntfyTopic = "belalbot-" + require("crypto").randomBytes(6).toString("hex");
-  saveJ(CFG,cfg);
-}
-const NTFY_TOPIC = process.env.NTFY_TOPIC || cfg.ntfyTopic;
-let _pushCooldowns = {}; // একই ধরনের নোটিফিকেশন বারবার স্প্যাম না করার জন্য
-function sendPush(title, message, {priority="default", tags="", cooldownKey=null, cooldownMs=0} = {}){
+// ── ইন-প্যানেল লাইফটাইম অ্যালার্ট সিস্টেম (ফোনে পুশ নোটিফিকেশনের বদলে — সবকিছু ওয়েবসাইটের ভিতরেই) ──
+// প্রতিটা গুরুত্বপূর্ণ ঘটনা (ক্র্যাশ, প্রতিরোধমূলক রিস্টার্ট, স্টোরেজ সতর্কতা ইত্যাদি) এখানে জমা থাকে,
+// MongoDB-তে ব্যাকআপসহ — তাই প্যানেল যতবারই restart হোক, অ্যালার্ট হিস্ট্রি হারায় না
+let alerts = loadJ(AFILE, []);
+let _alertCooldowns = {};
+function notify(level, title, message, {cooldownKey=null, cooldownMs=0} = {}){
   if(cooldownKey){
-    const last=_pushCooldowns[cooldownKey]||0;
+    const last=_alertCooldowns[cooldownKey]||0;
     if(Date.now()-last < cooldownMs) return; // এখনো কুলডাউনে, স্কিপ
-    _pushCooldowns[cooldownKey]=Date.now();
+    _alertCooldowns[cooldownKey]=Date.now();
   }
+  const entry = { id: Date.now()+"-"+Math.random().toString(36).slice(2,7), time: new Date().toISOString(), level, title, message, read:false };
+  alerts.push(entry);
+  if(alerts.length>500) alerts.shift(); // সাম্প্রতিক ৫০০টা যথেষ্ট, তার বেশি দরকার নেই
+  saveJ(AFILE, alerts);
+  saveAlertsToMongo(); // fire-and-forget ব্যাকআপ
+  bc({type:"alert", data: entry});
+}
+async function saveAlertsToMongo(){ await saveToMongo("__panel_alerts__", JSON.stringify(alerts), false); }
+async function restoreAlertsFromMongo(){
+  if(!db_connected || !FileModel) return;
   try{
-    const data = Buffer.from(message,"utf8");
-    const req = https.request({
-      hostname:"ntfy.sh", path:"/"+NTFY_TOPIC, method:"POST",
-      headers:{"Title":Buffer.from(title,"utf8").toString("base64"),"X-Title-Encoding":"base64","Priority":priority,"Tags":tags,"Content-Length":data.length}
-    }, r=>{ r.on("data",()=>{}); });
-    req.on("error", e=>console.log("⚠️ push notification ব্যর্থ:", e.message));
-    req.write(data); req.end();
-  }catch(e){ console.log("⚠️ push notification error:", e.message); }
+    const a = await FileModel.findOne({path:"__panel_alerts__"});
+    if(a && a.content){ try{ alerts = JSON.parse(a.content.toString()); saveJ(AFILE, alerts); }catch{} }
+  }catch(e){ console.log("⚠️ alerts restore error:", e.message); }
 }
 
 // ── MONGODB ──
@@ -89,6 +92,7 @@ async function connectMongo(){
 
     // restore files from MongoDB on startup
     await restorePanelPersistent();
+    await restoreAlertsFromMongo();
     await restoreFromMongo();
     await importRepoZipIfPresent();
 
@@ -323,7 +327,16 @@ function startBot(by="manual"){
     botStart=Date.now(); botReady=false; stats.starts++; saveJ(SFILE,stats); savePanelStatsToMongo();
     setShouldRun(true);
     log(`🟡 বট চালু হচ্ছে (${by}) — ${idx}`,"warn"); bc({type:"status",running:false,starting:true});
-    const NOISY=[/Warning: Accessing non-existent property/i,/circular dependency/i,/--trace-warnings/i,/\[DEP\d+\]/i,/is deprecated\. Please use/i];
+    const NOISY=[
+      /Warning: Accessing non-existent property/i,/circular dependency/i,/--trace-warnings/i,/\[DEP\d+\]/i,/is deprecated\. Please use/i,
+      /node_modules[\\/](mqtt|fca-unofficial|bluebird)[\\/]/i,     // fca-unofficial/mqtt-এর নিজস্ব internal stack trace লাইন
+      /at (MqttClient|Writable|Duplexify|Socket|TLSSocket|writeOrBuffer|doWrite|addChunk)/i, // mqtt লাইব্রেরির internal কল-স্ট্যাক
+      /not part of the conversation \d+/i,                          // bot যে গ্রুপে নেই, সেখানে পুরনো মেসেজ পাঠানোর normal ব্যর্থতা
+      /Cannot get MQTT region/i,                                    // fca-unofficial-এর পরিচিত, প্রভাবহীন warning
+      /ScreenTime and Badge telemetry/i,                            // fca-unofficial-এর normal telemetry নোটিশ
+      /Unrecognized option given to setOptions/i,                   // fca-unofficial-এর পুরনো config warning, ক্ষতিকর না
+      /unsendMessage.*(isNotCritical|rid:|payload:|lid:)/i          // পুরনো মেসেজ unsend করতে ব্যর্থ হওয়ার normal detail, গুরুত্বপূর্ণ না
+    ];
     const isNoisy=s=>NOISY.some(rx=>rx.test(s));
     // eslint-disable-next-line no-control-regex
     const stripAnsi=s=>s.replace(/\x1B\[[0-9;]*[a-zA-Z]/g,"");
@@ -347,7 +360,7 @@ function startBot(by="manual"){
             time: new Date().toISOString(), code: code||sig, uptimeSec: up
           }));
         }catch{}
-        sendPush("🔴 বট ক্র্যাশ করেছে!", `কোড: ${code||sig} | আগের সেশন সচল ছিল: ${fmtS(up)}\nAuto-restart চেষ্টা চলছে...`, {priority:"high", tags:"rotating_light"});
+        notify("error", "🔴 বট ক্র্যাশ করেছে!", `কোড: ${code||sig} | আগের সেশন সচল ছিল: ${fmtS(up)} | Auto-restart চেষ্টা চলছে...`);
       }
       saveJ(SFILE,stats); savePanelStatsToMongo();
       log(`🔴 বট বন্ধ (code:${code||sig}, uptime:${fmtS(up)})`,"error");
@@ -401,7 +414,7 @@ function startBot(by="manual"){
         actuallySpawnBot();
       } else {
         log(`⚠️ npm install ব্যর্থ (code ${code}, RAM এখন: ${ramAfter}MB): `+npmErr.slice(-300),"error");
-        sendPush("⚠️ npm install ব্যর্থ", "বট চালু করা যায়নি — dependency install fail করেছে। প্যানেলের লগ দেখো।", {priority:"high", tags:"warning"});
+        notify("error", "⚠️ npm install ব্যর্থ", "বট চালু করা যায়নি — dependency install fail করেছে। প্যানেলের লগ দেখো।");
         bc({type:"status",running:false});
       }
     });
@@ -456,7 +469,7 @@ setInterval(()=>{
     _highRamStreak++;
     if(_highRamStreak>=3){ // পরপর ৩ বার (≈১.৫ মিনিট) উচ্চ থাকলেই তবে রিস্টার্ট — এক-দুইবারের স্পাইকে না
       log(`🛡️ প্রতিরোধমূলক রিস্টার্ট — বট RAM ${botMB}MB (৫১২MB সীমার কাছাকাছি)`,"warn");
-      sendPush("🛡️ প্রতিরোধমূলক রিস্টার্ট", `বট RAM ${botMB}MB ছুঁয়ে ফেলেছিল (সীমা ৫১২MB) — ক্র্যাশ হওয়ার আগেই নিজে থেকে নিরাপদে রিস্টার্ট করা হলো।`, {priority:"default", tags:"shield", cooldownKey:"preventive-restart", cooldownMs:10*60*1000});
+      notify("warn", "🛡️ প্রতিরোধমূলক রিস্টার্ট", `বট RAM ${botMB}MB ছুঁয়ে ফেলেছিল (সীমা ৫১২MB) — ক্র্যাশ হওয়ার আগেই নিজে থেকে নিরাপদে রিস্টার্ট করা হলো।`, {cooldownKey:"preventive-restart", cooldownMs:10*60*1000});
       _highRamStreak=0;
       stopBot(); setTimeout(()=>startBot("preventive-ram-guard"),3000);
     }
@@ -472,7 +485,7 @@ setInterval(async()=>{
     const s = await mongoose.connection.db.stats();
     const usedMB = (s.dataSize+s.indexSize)/1024/1024;
     if(usedMB > 512*0.85){
-      sendPush("⚠️ MongoDB স্টোরেজ প্রায় শেষ", `${Math.round(usedMB)}MB / 512MB ব্যবহার হয়ে গেছে (Atlas M0 ফ্রি সীমা)। পুরনো/অপ্রয়োজনীয় ডেটা সরানো দরকার হতে পারে।`, {priority:"default", tags:"warning", cooldownKey:"mongo-storage-warn", cooldownMs:24*60*60*1000});
+      notify("warn", "⚠️ MongoDB স্টোরেজ প্রায় শেষ", `${Math.round(usedMB)}MB / 512MB ব্যবহার হয়ে গেছে (Atlas M0 ফ্রি সীমা)। পুরনো/অপ্রয়োজনীয় ডেটা সরানো দরকার হতে পারে।`, {cooldownKey:"mongo-storage-warn", cooldownMs:24*60*60*1000});
     }
   }catch{}
 },30*60*1000); // প্রতি ৩০ মিনিটে চেক, কিন্তু নোটিফিকেশন দিনে একবারের বেশি না (cooldown দিয়ে)
@@ -664,10 +677,13 @@ app.get("/api/files",auth,(req,res)=>{
   try{
     const dir=safe(BDIR,req.query.path||"");
     if(!fs.existsSync(dir))return res.json({items:[],current:req.query.path||""});
-    const items=fs.readdirSync(dir).map(name=>{
-      const f=path.join(dir,name),s=fs.statSync(f);
-      return{name,isDir:s.isDirectory(),size:s.size,mtime:s.mtime,ext:path.extname(name).toLowerCase()};
-    }).sort((a,b)=>(b.isDir-a.isDir)||a.name.localeCompare(b.name));
+    const showHidden = req.query.showHidden==="1";
+    const items=fs.readdirSync(dir)
+      .filter(name=> showHidden || !name.startsWith(".")) // অভ্যন্তরীণ মার্কার ফাইল (.crash_flag.json ইত্যাদি) ডিফল্টে লুকানো — এলোমেলো লাগে
+      .map(name=>{
+        const f=path.join(dir,name),s=fs.statSync(f);
+        return{name,isDir:s.isDirectory(),size:s.size,mtime:s.mtime,ext:path.extname(name).toLowerCase()};
+      }).sort((a,b)=>(b.isDir-a.isDir)||a.name.localeCompare(b.name));
     res.json({items,current:req.query.path||""});
   }catch(e){res.status(500).json({error:e.message});}
 });
@@ -1011,10 +1027,8 @@ app.post("/api/cookie/save",auth,async(req,res)=>{
 
 // ── SETTINGS ──
 app.get("/api/settings",auth,(req,res)=>res.json({...cfg,mongoConnected:db_connected}));
-app.post("/api/notify/test",auth,(req,res)=>{
-  sendPush("🔔 টেস্ট নোটিফিকেশন", "এটা একটা টেস্ট মেসেজ — যদি এটা দেখতে পাচ্ছো, তাহলে সেটআপ ঠিকভাবে হয়ে গেছে! ✅", {priority:"default", tags:"white_check_mark"});
-  res.json({ok:true});
-});
+app.get("/api/alerts",auth,(req,res)=>res.json({alerts: alerts.slice().reverse()}));
+app.post("/api/alerts/clear",auth,(req,res)=>{alerts=[];saveJ(AFILE,alerts);saveAlertsToMongo();res.json({ok:true});});
 app.post("/api/settings/save",auth,(req,res)=>{
   Object.assign(cfg,req.body);
   autoRestart=true; cfg.autoRestart=true; // ── সবসময় ON, সেটিংস থেকে বন্ধ করা যাবে না
@@ -1129,6 +1143,37 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,sans-
 .dot.starting{background:var(--yw);box-shadow:0 0 8px var(--yw);animation:blink 1s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 .top-out{padding:6px 10px;border-radius:8px;border:1px solid rgba(240,82,82,.3);background:transparent;color:var(--rd);font-size:11px;cursor:pointer}
+
+.bell-btn{position:relative;background:transparent;border:1px solid var(--bd);border-radius:9px;padding:5px 9px;font-size:15px;cursor:pointer;color:var(--tx)}
+.bell-badge{position:absolute;top:-5px;right:-5px;background:var(--rd);color:#fff;font-size:9px;font-weight:800;min-width:16px;height:16px;border-radius:8px;display:flex;align-items:center;justify-content:center;padding:0 3px}
+
+.alert-banner{position:fixed;top:58px;left:8px;right:8px;z-index:500;display:flex;flex-direction:column;gap:6px;pointer-events:none}
+.alert-banner-item{pointer-events:auto;background:var(--s2);border:1px solid var(--bd);border-left:4px solid var(--bl);border-radius:10px;padding:10px 12px;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,.4);animation:alertSlide .3s ease;display:flex;gap:8px;align-items:flex-start}
+.alert-banner-item.error{border-left-color:var(--rd)}
+.alert-banner-item.warn{border-left-color:var(--yw)}
+.alert-banner-item.info{border-left-color:var(--bl)}
+.alert-banner-item .ab-x{margin-left:auto;cursor:pointer;color:var(--mu);font-size:14px;flex-shrink:0}
+@keyframes alertSlide{from{transform:translateY(-20px);opacity:0}to{transform:translateY(0);opacity:1}}
+
+.alert-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:600}
+.alert-overlay.show{display:block}
+.alert-drawer{position:fixed;top:0;right:-100%;width:min(420px,92vw);height:100%;background:var(--s1);z-index:601;transition:right .25s ease;box-shadow:-10px 0 40px rgba(0,0,0,.5);display:flex;flex-direction:column}
+.alert-drawer.show{right:0}
+.alert-drawer-head{display:flex;justify-content:space-between;align-items:center;padding:16px;border-bottom:1px solid var(--bd)}
+.alert-list{flex:1;overflow-y:auto;padding:10px}
+.alert-item{background:var(--s2);border-left:3px solid var(--bd);border-radius:8px;padding:10px 12px;margin-bottom:8px;font-size:12px}
+.alert-item.error{border-left-color:var(--rd)}
+.alert-item.warn{border-left-color:var(--yw)}
+.alert-item.info{border-left-color:var(--bl)}
+.alert-item-title{font-weight:700;margin-bottom:3px}
+.alert-item-time{font-size:10px;color:var(--mu);margin-top:4px}
+.alert-empty{text-align:center;color:var(--mu);padding:40px 20px;font-size:13px}
+
+body.log-fullscreen .top,body.log-fullscreen .tabs,body.log-fullscreen .alert-banner{display:none !important}
+body.log-fullscreen .main{padding:0;margin:0;max-width:100%}
+body.log-fullscreen #pg-logs{padding:0}
+body.log-fullscreen .lbox{position:fixed;inset:0;height:100vh;border-radius:0;border:none;background:#000;font-size:13px;padding:10px 10px 50px 10px;z-index:300}
+body.log-fullscreen .log-bar{position:fixed;bottom:0;left:0;right:0;z-index:301;background:rgba(5,5,10,.97);backdrop-filter:blur(10px);padding:8px;margin:0;border-top:1px solid #1a3a1a}
 .tabs{position:fixed;bottom:0;left:0;right:0;background:rgba(13,13,24,.97);backdrop-filter:blur(20px);border-top:1px solid var(--bd);display:grid;grid-template-columns:repeat(7,1fr);height:60px;z-index:200;padding-bottom:env(safe-area-inset-bottom)}
 .tab{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;cursor:pointer;border:none;background:transparent;color:var(--mu);transition:.15s;position:relative}
 .tab.active{color:var(--ac)}
@@ -1319,8 +1364,23 @@ textarea.ci:focus{border-color:var(--ac)}
     <div class="top-pill"><div class="dot" id="tDot"></div><span id="tStatus">লোড...</span></div>
     <div class="top-pill" id="mongoPill"><div class="dot" id="mongoDot"></div><span id="mongoStatus">DB</span></div>
   </div>
+  <button class="bell-btn" onclick="openAlerts()">🔔<span class="bell-badge" id="bellBadge" style="display:none">0</span></button>
   <button class="top-out" onclick="location.href='/logout'">বের</button>
 </div>
+
+<div id="alertBanner" class="alert-banner"></div>
+
+<div id="alertDrawer" class="alert-drawer">
+  <div class="alert-drawer-head">
+    <div style="font-weight:800;font-size:15px">🔔 নোটিফিকেশন (লাইফটাইম)</div>
+    <div style="display:flex;gap:8px">
+      <button class="tbtn" onclick="clearAlerts()">🗑 মুছো</button>
+      <button class="tbtn" onclick="closeAlerts()">✕ বন্ধ</button>
+    </div>
+  </div>
+  <div id="alertList" class="alert-list"></div>
+</div>
+<div id="alertOverlay" class="alert-overlay" onclick="closeAlerts()"></div>
 
 <div class="main">
 
@@ -1487,6 +1547,7 @@ textarea.ci:focus{border-color:var(--ac)}
     <button class="lf" onclick="clearLogs()">🗑</button>
     <button class="lf" onclick="window.open('/api/bot/downloadlog')">⬇️</button>
     <button class="lf" onclick="autoScroll=!autoScroll;this.textContent=autoScroll?'↓ Auto':'↕ Man'">↓ Auto</button>
+    <button class="lf" onclick="toggleLogFullscreen()">⛶ ফুলস্ক্রিন</button>
   </div>
   <div class="lbox" id="lbox"></div>
 </div>
@@ -1588,23 +1649,6 @@ textarea.ci:focus{border-color:var(--ac)}
     <div style="font-size:11px;color:var(--mu);margin-top:10px">💡 Sync করলে সব ফাইল MongoDB তে সেভ হবে। Render restart হলে অটো restore হবে।</div>
   </div>
 
-  <!-- PUSH NOTIFICATIONS -->
-  <div class="set-card">
-    <div class="set-title">📲 ফোনে লাইভ নোটিফিকেশন</div>
-    <div style="font-size:12px;color:var(--tx);line-height:1.8;margin-bottom:12px">
-      <b>একবারই সেটআপ করতে হবে:</b><br>
-      ১. Play Store থেকে <b>ntfy</b> অ্যাপ (বিনামূল্যে) ইনস্টল করো<br>
-      ২. অ্যাপ খুলে "+" চেপে নিচের টপিক নামটা বসিয়ে সাবস্ক্রাইব করো<br>
-      ৩. ব্যস — বট ক্র্যাশ করলে, RAM বেশি হলে, বা MongoDB প্রায় শেষ হয়ে গেলে সাথে সাথে ফোনে নোটিফিকেশন আসবে
-    </div>
-    <div class="set-row"><div class="sr-l">টপিক নাম</div><input class="sinp" type="text" id="sNtfyTopic" readonly style="font-family:monospace"></div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
-      <button class="tbtn" onclick="copyNtfyTopic()">📋 কপি করো</button>
-      <button class="tbtn p" onclick="testPush()">🔔 টেস্ট নোটিফিকেশন পাঠাও</button>
-    </div>
-    <div style="font-size:10px;color:var(--mu);margin-top:10px">🔗 ব্রাউজার থেকেও দেখা যায়: <span id="sNtfyLink" style="color:var(--bl)"></span></div>
-  </div>
-
   <!-- SETTINGS -->
   <div class="set-card">
     <div class="set-title">🔧 Settings</div>
@@ -1685,10 +1729,60 @@ function connectWS(){
     if(m.type==="logs"){document.getElementById("lbox").innerHTML="";m.data.forEach(appendLog);}
     if(m.type==="status") updateStatus(m.running,m.starting);
     if(m.type==="clearLogs") document.getElementById("lbox").innerHTML="";
+    if(m.type==="alert"){ showAlertBanner(m.data); _alertsCache.unshift(m.data); _unreadAlerts++; updateBellBadge(); if(document.getElementById("alertDrawer").classList.contains("show")) renderAlertList(); }
     if(m.type==="mongo") updateMongo(m.connected);
   };
   ws.onclose=()=>setTimeout(connectWS,3000);
 }
+
+// ── ইন-প্যানেল অ্যালার্ট সিস্টেম ──
+let _alertsCache=[], _unreadAlerts=0;
+const _lvlIcon={info:"ℹ️",warn:"⚠️",error:"🔴"};
+function showAlertBanner(a){
+  const box=document.getElementById("alertBanner");
+  const d=document.createElement("div");
+  d.className="alert-banner-item "+(a.level||"info");
+  d.innerHTML='<span>'+(_lvlIcon[a.level]||"ℹ️")+'</span><div><b>'+esc(a.title)+'</b><div style="color:var(--mu);margin-top:2px">'+esc(a.message)+'</div></div><span class="ab-x" onclick="this.parentElement.remove()">✕</span>';
+  box.appendChild(d);
+  setTimeout(()=>{ if(d.parentElement) d.remove(); }, 8000);
+}
+function updateBellBadge(){
+  const b=document.getElementById("bellBadge");
+  if(_unreadAlerts>0){ b.style.display="flex"; b.textContent=_unreadAlerts>99?"99+":_unreadAlerts; }
+  else b.style.display="none";
+}
+function renderAlertList(){
+  const list=document.getElementById("alertList");
+  if(!_alertsCache.length){ list.innerHTML='<div class="alert-empty">🔕 কোনো নোটিফিকেশন নেই</div>'; return; }
+  list.innerHTML=_alertsCache.map(a=>
+    '<div class="alert-item '+(a.level||"info")+'"><div class="alert-item-title">'+(_lvlIcon[a.level]||"ℹ️")+' '+esc(a.title)+'</div><div>'+esc(a.message)+'</div><div class="alert-item-time">'+new Date(a.time).toLocaleString("bn-BD")+'</div></div>'
+  ).join("");
+}
+async function openAlerts(){
+  document.getElementById("alertDrawer").classList.add("show");
+  document.getElementById("alertOverlay").classList.add("show");
+  _unreadAlerts=0; updateBellBadge();
+  try{
+    const d=await fetch("/api/alerts").then(r=>r.json());
+    _alertsCache=d.alerts||[];
+  }catch{}
+  renderAlertList();
+}
+function closeAlerts(){
+  document.getElementById("alertDrawer").classList.remove("show");
+  document.getElementById("alertOverlay").classList.remove("show");
+}
+async function clearAlerts(){
+  if(!confirm("সব নোটিফিকেশন মুছবে?")) return;
+  await fetch("/api/alerts/clear",{method:"POST"});
+  _alertsCache=[]; renderAlertList();
+}
+(async function initAlerts(){
+  try{
+    const d=await fetch("/api/alerts").then(r=>r.json());
+    _alertsCache=d.alerts||[];
+  }catch{}
+})();
 
 function appendLog(e){
   if(logFilter!=="all"&&e.type!==logFilter)return;
@@ -1704,6 +1798,11 @@ function appendLog(e){
 
 function esc(t){return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
 function setLF(f,btn){logFilter=f;document.querySelectorAll(".lf").forEach(b=>b.classList.remove("on"));btn.classList.add("on");document.querySelectorAll(".le").forEach(el=>el.style.display=(f==="all"||el.dataset.t===f)?"flex":"none");}
+function toggleLogFullscreen(){
+  document.body.classList.toggle("log-fullscreen");
+  const box=document.getElementById("lbox");
+  if(autoScroll) box.scrollTop=box.scrollHeight;
+}
 function clearLogs(){fetch("/api/bot/clearlogs",{method:"POST"});}
 function clearLogFile(){if(!confirm("Log file মুছবেন?"))return;fetch("/api/bot/clearlogfile",{method:"POST"}).then(r=>r.json()).then(d=>toast(d.ok?"✅ মুছা হয়েছে":"❌ ব্যর্থ",d.ok?"success":"error"));}
 
@@ -2164,8 +2263,6 @@ async function loadSettings(){
   document.getElementById("sAR").checked=d.autoRestart||false;
   document.getElementById("sSched").checked=d.scheduleRestart||false;
   document.getElementById("sTime").value=d.scheduleTime||"03:00";
-  const ntTopic=document.getElementById("sNtfyTopic");
-  if(ntTopic){ ntTopic.value=d.ntfyTopic||""; document.getElementById("sNtfyLink").textContent="ntfy.sh/"+(d.ntfyTopic||""); }
   const mi=document.getElementById("mongoInfo");
   if(mi) mi.textContent=d.mongoConnected?"MongoDB সংযুক্ত ✅":"MongoDB বিচ্ছিন্ন ❌";
 }
@@ -2179,17 +2276,6 @@ async function changePw(){
   toast(d.ok?"✅ "+d.msg:"❌ "+d.msg,d.ok?"success":"error");
   if(d.ok){document.getElementById("sCur").value="";document.getElementById("sNew").value="";}
 }
-function copyNtfyTopic(){
-  const v=document.getElementById("sNtfyTopic").value;
-  if(!v) return;
-  navigator.clipboard?.writeText(v).then(()=>toast("📋 কপি হয়েছে","success")).catch(()=>toast("❌ কপি ব্যর্থ","error"));
-}
-async function testPush(){
-  toast("⏳ পাঠানো হচ্ছে...","success");
-  const d=await fetch("/api/notify/test",{method:"POST"}).then(r=>r.json()).catch(()=>null);
-  toast(d&&d.ok?"✅ পাঠানো হয়েছে — ১০-১৫ সেকেন্ডে ফোনে দেখো":"❌ ব্যর্থ হয়েছে",d&&d.ok?"success":"error");
-}
-
 // TOAST
 function toast(msg,type="success"){
   const w=document.getElementById("tw"),el=document.createElement("div");

@@ -8,7 +8,7 @@ const fs        = require("fs");
 const path      = require("path");
 const https     = require("https");
 const http2     = require("http");
-const { spawn, fork, execSync } = require("child_process");
+const { spawn, fork, execSync, spawnSync } = require("child_process");
 const archiver  = require("archiver");
 const unzipper  = require("unzipper");
 
@@ -340,8 +340,15 @@ function startBot(by="manual"){
     const isNoisy=s=>NOISY.some(rx=>rx.test(s));
     // eslint-disable-next-line no-control-regex
     const stripAnsi=s=>s.replace(/\x1B\[[0-9;]*[a-zA-Z]/g,"");
-    botProc.stdout.on("data",d=>{const s=stripAnsi(d.toString()).trim();if(s&&!isNoisy(s))log(s,"info");});
-    botProc.stderr.on("data",d=>{const s=stripAnsi(d.toString()).trim();if(s&&!isNoisy(s))log(s,"error");});
+    const classify=(s)=>{
+      if(/\[ক্রটি\]|ERR!|❌|Unhandled Rejection|uncaughtException/i.test(s)) return "error";
+      if(/\[সতর্ক\]|⚠️|WARN\b/i.test(s)) return "warn";
+      if(/\[সফল\]|✅|সফলভাবে/i.test(s)) return "success";
+      return "info";
+    };
+    const cleanPrefix=(s)=> s.replace(/^\s*[⚠️❌✅]*\s*\[(সতর্ক|ক্রটি|সফল|তথ্য)\]\s*»\s*/u,"").replace(/^\s*[⚠️❌✅ℹ️]+\s*/u,"").trim();
+    botProc.stdout.on("data",d=>{const s=stripAnsi(d.toString()).trim();if(s&&!isNoisy(s))log(cleanPrefix(s),classify(s));});
+    botProc.stderr.on("data",d=>{const s=stripAnsi(d.toString()).trim();if(s&&!isNoisy(s))log(cleanPrefix(s),"error");});
     botProc.on("message",(msg)=>{
       if(msg?.type==="bot_ready"){
         botReady=true;
@@ -457,6 +464,22 @@ setInterval(()=>{
   }
 },10000);
 
+// ── কানেকশন-রিফ্রেশ (প্রতি ৬ ঘণ্টায়) ──
+// fca-unofficial (unofficial FB API লাইব্রেরি)-র একটা পরিচিত সমস্যা আছে: বট প্রসেস বেঁচে থাকে
+// (প্যানেলে "✅ চলছে" দেখায়) কিন্তু Facebook-এর real-time message listener (MQTT) মাঝে মাঝে
+// নিঃশব্দে বন্ধ হয়ে যায় — কোনো ক্র্যাশ ছাড়াই, তাই প্যানেল এটা নিজে থেকে ধরতে পারে না।
+// এটা কোড দিয়ে ১০০% বন্ধ করা যায় না (unofficial API-র নিজস্ব সীমাবদ্ধতা), কিন্তু নিয়মিত
+// বিরতিতে connection রিফ্রেশ করলে ঝুঁকি অনেকটাই কমে — তাই প্রতি ৬ ঘণ্টায় একবার প্রতিরোধমূলক restart।
+setInterval(()=>{
+  if(!botProc || !botReady || !botStart) return;
+  const upHours = (Date.now()-botStart)/(3600*1000);
+  if(upHours >= 6){
+    log("🔄 কানেকশন-রিফ্রেশ — Facebook-এর real-time listener নিঃশব্দে বন্ধ হওয়া ঠেকাতে প্রতিরোধমূলক রিস্টার্ট","warn");
+    notify("info", "🔄 কানেকশন-রিফ্রেশ", "প্রতি ৬ ঘণ্টায় প্রতিরোধমূলক রিস্টার্ট হয়েছে (Facebook listener সতেজ রাখতে)।", {cooldownKey:"conn-refresh", cooldownMs:5*60*60*1000});
+    stopBot(); setTimeout(()=>startBot("connection-refresh"),3000);
+  }
+},10*60*1000); // প্রতি ১০ মিনিটে চেক করা হয়, কিন্তু আসল রিস্টার্ট ৬ ঘণ্টা পার হলেই একবার
+
 // ── প্রতিরোধমূলক RAM গার্ড ── প্যানেল খোলা থাকুক বা না থাকুক, প্রতি ৩০ সেকেন্ডে ব্যাকগ্রাউন্ডে
 // নিজে থেকেই চেক করে — RAM যদি ক্রমাগত ৪৭০MB+ থাকে (Render-এর ৫১২MB হার্ড সীমার কাছাকাছি),
 // তাহলে OOM crash হওয়ার আগেই বট নিজে থেকে গ্রেসফুলি রিস্টার্ট করে দেয় — আর ফোনে সাথে সাথে জানিয়ে দেয়
@@ -532,7 +555,23 @@ app.get("/api/bot/downloadlog",auth,(req,res)=>{if(fs.existsSync(LFILE))res.down
 app.post("/api/bot/clearlogfile",auth,(req,res)=>{try{fs.writeFileSync(LFILE,"");res.json({ok:true});}catch(e){res.json({ok:false,msg:e.message});}});
 
 app.get("/api/stats",auth,(req,res)=>{
-  function countF(d){let c=0;try{fs.readdirSync(d).forEach(f=>{const s=fs.statSync(path.join(d,f));c+=s.isDirectory()?countF(path.join(d,f)):1;});}catch{}return c;}
+  let _fileCountCache = {value:0, at:0};
+  function countF(d){
+    if(Date.now()-_fileCountCache.at < 60000) return _fileCountCache.value; // ৬০ সেকেন্ড ক্যাশ — বারবার ভারী ডিস্ক-স্ক্যান এড়ানো
+    function walk(dir){
+      let c=0;
+      try{
+        fs.readdirSync(dir).forEach(f=>{
+          if(f==="node_modules"||f===".git") return; // এগুলো বট ফাইল না, গুনে লাভ নেই — শুধু সময় নষ্ট
+          const s=fs.statSync(path.join(dir,f));
+          c+=s.isDirectory()?walk(path.join(dir,f)):1;
+        });
+      }catch{}
+      return c;
+    }
+    _fileCountCache = {value: walk(d), at: Date.now()};
+    return _fileCountCache.value;
+  }
   res.json({...stats,running:!!botProc,ready:botReady,currentUptime:botStart?Math.floor((Date.now()-botStart)/1000):0,
     autoRestart,memMB:Math.round(process.memoryUsage().rss/1024/1024),
     serverUptime:Math.floor(process.uptime()),node:process.version,
@@ -694,6 +733,81 @@ app.get("/api/file/read",auth,(req,res)=>{
     if(s.size>5*1024*1024) return res.json({error:"ফাইল অনেক বড় (5MB+)"});
     res.json({content:fs.readFileSync(f,"utf8"),size:s.size});
   }catch(e){res.status(500).json({error:e.message});}
+});
+
+// ── 🧪 কমান্ড টেস্টার — সিনট্যাক্স, প্রয়োজনীয় স্ট্রাকচার, dependency, আর ফাইলের ভিতরের API লিংক লাইভ চেক ──
+function testUrl(url){
+  return new Promise(resolve=>{
+    try{
+      const mod = url.startsWith("https") ? https : require("http");
+      const req = mod.request(url, {method:"HEAD", timeout:6000}, r=>{
+        resolve({url, ok: r.statusCode<400, status:r.statusCode});
+        r.resume();
+      });
+      req.on("timeout", ()=>{ req.destroy(); resolve({url, ok:false, status:"timeout"}); });
+      req.on("error", e=>resolve({url, ok:false, status:"error: "+e.message}));
+      req.end();
+    }catch(e){ resolve({url, ok:false, status:"error: "+e.message}); }
+  });
+}
+app.post("/api/file/test",auth,async(req,res)=>{
+  try{
+    const f=safe(BDIR,req.body.path);
+    if(!fs.existsSync(f)) return res.json({ok:false,msg:"ফাইল খুঁজে পাওয়া যায়নি"});
+    const content = fs.readFileSync(f,"utf8");
+    const result = { syntax:null, structure:null, dependencies:[], apis:[] };
+
+    // ১. সিনট্যাক্স চেক
+    const chk = spawnSync(process.execPath, ["--check", f], {timeout:10000});
+    result.syntax = chk.status===0
+      ? {ok:true, msg:"সিনট্যাক্স ঠিক আছে ✅"}
+      : {ok:false, msg:(chk.stderr||"").toString().split("\n").slice(0,4).join(" ")||"সিনট্যাক্স এরর"};
+
+    if(result.syntax.ok){
+      // ২. স্ট্রাকচার চেক — আলাদা isolated প্রসেসে require করা হচ্ছে, যাতে ভাঙা ফাইল মূল প্যানেলকে ক্র্যাশ না করে
+      const probe = spawnSync(process.execPath, ["-e", `
+        try{
+          const cmd = require(${JSON.stringify(f)});
+          const out = {
+            hasConfig: !!(cmd && cmd.config),
+            name: cmd?.config?.name || null,
+            aliases: cmd?.config?.aliases || [],
+            hasRunFn: !!(cmd && (cmd.run || cmd.onStart || cmd.onCall)),
+            dependencies: cmd?.config?.dependencies || {}
+          };
+          console.log("###RESULT###"+JSON.stringify(out));
+        }catch(e){ console.log("###ERROR###"+e.message); }
+      `], {cwd: path.dirname(f), timeout:8000});
+      const out = (probe.stdout||"").toString();
+      if(out.includes("###ERROR###")){
+        result.structure = {ok:false, msg:"ফাইল লোড করতে ব্যর্থ: "+out.split("###ERROR###")[1].trim().slice(0,200)};
+      } else if(out.includes("###RESULT###")){
+        try{
+          const parsed = JSON.parse(out.split("###RESULT###")[1].trim());
+          const problems=[];
+          if(!parsed.hasConfig) problems.push("module.exports.config নেই");
+          if(!parsed.name) problems.push("config.name নেই");
+          if(!parsed.hasRunFn) problems.push("run/onStart/onCall ফাংশন নেই");
+          result.structure = problems.length
+            ? {ok:false, msg:"সমস্যা: "+problems.join(", ")}
+            : {ok:true, msg:`ঠিক আছে ✅ — নাম: "${parsed.name}"${parsed.aliases.length?", alias: "+parsed.aliases.join(", "):""}`};
+          // ৩. Dependency চেক
+          for(const [pkg] of Object.entries(parsed.dependencies||{})){
+            try{ require.resolve(pkg, {paths:[path.join(BDIR,"node_modules")]}); result.dependencies.push({pkg, ok:true}); }
+            catch{ result.dependencies.push({pkg, ok:false}); }
+          }
+        }catch{ result.structure = {ok:false, msg:"ফলাফল পার্স করতে ব্যর্থ"}; }
+      } else {
+        result.structure = {ok:false, msg:"টাইমআউট বা কোনো আউটপুট পাওয়া যায়নি (৮ সেকেন্ডের বেশি সময় নিয়েছে)"};
+      }
+
+      // ৪. ফাইলের ভিতরের API URL বের করে লাইভ টেস্ট (সর্বোচ্চ ৫টা, ডুপ্লিকেট বাদে)
+      const urls = [...new Set((content.match(/https?:\/\/[^\s"'`)]+/g)||[]))].slice(0,5);
+      result.apis = await Promise.all(urls.map(testUrl));
+    }
+
+    res.json({ok:true, result});
+  }catch(e){ res.status(500).json({ok:false, error:e.message}); }
 });
 
 app.post("/api/file/save",auth,async(req,res)=>{
@@ -1169,6 +1283,23 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,sans-
 .alert-item-time{font-size:10px;color:var(--mu);margin-top:4px}
 .alert-empty{text-align:center;color:var(--mu);padding:40px 20px;font-size:13px}
 
+.test-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:700}
+.test-overlay.show{display:block}
+.test-panel{display:none;position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:min(480px,92vw);max-height:80vh;background:var(--s1);border:1px solid var(--bd);border-radius:16px;z-index:701;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+.test-panel.show{display:flex}
+.test-head{display:flex;justify-content:space-between;align-items:center;padding:16px;border-bottom:1px solid var(--bd)}
+.test-body{flex:1;overflow-y:auto;padding:14px}
+.test-sec{background:var(--s2);border-radius:10px;padding:12px;margin-bottom:10px;border-left:3px solid var(--bd)}
+.test-sec.ok{border-left-color:var(--gr)}
+.test-sec.bad{border-left-color:var(--rd)}
+.test-sec-title{font-weight:700;font-size:12.5px;margin-bottom:4px;display:flex;align-items:center;gap:6px}
+.test-sec-msg{font-size:12px;color:var(--mu);word-break:break-word}
+.test-api-row{display:flex;justify-content:space-between;gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+.test-api-url{color:var(--mu);word-break:break-all;flex:1}
+.test-api-status{flex-shrink:0;font-weight:700}
+.test-api-status.ok{color:var(--gr)}
+.test-api-status.bad{color:var(--rd)}
+
 body.log-fullscreen .top,body.log-fullscreen .tabs,body.log-fullscreen .alert-banner{display:none !important}
 body.log-fullscreen .main{padding:0;margin:0;max-width:100%}
 body.log-fullscreen #pg-logs{padding:0}
@@ -1302,23 +1433,40 @@ textarea.ci:focus{border-color:var(--ac)}
 .tbtn.d{border-color:rgba(240,82,82,.3);color:var(--rd)}
 .sinput{width:100%;padding:10px 14px;border-radius:10px;border:1px solid var(--bd);background:var(--s2);color:var(--tx);font-size:13px;outline:none;margin-bottom:10px;transition:.2s}
 .sinput:focus{border-color:var(--ac)}
-.flist{background:var(--s2);border:1px solid var(--bd);border-radius:14px;overflow:hidden}
-.frow{display:flex;align-items:center;gap:10px;padding:11px 12px;border-bottom:1px solid rgba(255,255,255,.03);cursor:pointer;transition:.12s}
-.frow:last-child{border-bottom:none}
-.frow:active{background:rgba(108,99,255,.07)}
-.fi{font-size:19px;flex-shrink:0;width:24px;text-align:center}
+.flist{background:transparent;border:none;overflow:visible;display:flex;flex-direction:column;gap:7px}
+.frow{display:flex;align-items:center;gap:12px;padding:12px 13px;border-radius:13px;cursor:pointer;transition:.15s;background:linear-gradient(135deg,var(--s2),var(--s1));border:1px solid var(--bd)}
+.frow:active{transform:scale(.98);border-color:var(--ac)}
+.fi{font-size:17px;flex-shrink:0;width:38px;height:38px;border-radius:11px;display:flex;align-items:center;justify-content:center;background:var(--s3)}
+.fi.ft-code{background:rgba(255,123,114,.15)}
+.fi.ft-data{background:rgba(121,192,255,.15)}
+.fi.ft-media{background:rgba(210,168,255,.15)}
+.fi.ft-doc{background:rgba(126,231,135,.15)}
+.fi.ft-archive{background:rgba(240,180,41,.15)}
+.fi.ft-dir{background:rgba(108,99,255,.18)}
 .fn{flex:1;overflow:hidden}
-.fn-name{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
-.fn-meta{font-size:10px;color:var(--mu);margin-top:2px}
+.fn-name{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.fn-meta{font-size:10px;color:var(--mu);margin-top:3px}
 .fa{display:flex;gap:3px;flex-shrink:0}
-.fab{padding:5px 7px;border-radius:6px;border:none;background:var(--s3);color:var(--mu);font-size:11px;cursor:pointer;transition:.12s}
+.fab{padding:6px 8px;border-radius:8px;border:none;background:var(--s3);color:var(--mu);font-size:11px;cursor:pointer;transition:.12s}
 .fab:hover{background:var(--bd);color:var(--tx)}
 .fab.del:hover{background:rgba(240,82,82,.15);color:var(--rd)}
+.fm-summary{display:flex;justify-content:space-between;font-size:10.5px;color:var(--mu);padding:2px 4px 10px}
 .empty-fm{padding:40px;text-align:center;color:var(--mu)}
 .ed-top{background:var(--s2);border:1px solid var(--bd);border-radius:12px 12px 0 0;padding:10px 12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .ed-fn{flex:1;font-size:12px;color:var(--ac);font-weight:700;overflow:hidden;text-overflow:ellipsis}
 .ed-lang{font-size:10px;color:var(--mu);background:var(--s3);padding:2px 7px;border-radius:5px}
 #ced{width:100%;height:calc(100vh - 240px);background:#010108;border:1px solid var(--bd);border-top:none;border-radius:0 0 12px 12px;padding:14px;color:#e6edf3;font-family:'Courier New',monospace;font-size:13px;line-height:1.8;resize:none;outline:none;tab-size:2}
+.ed-wrap{position:relative}
+.ed-wrap #ced.hl-on{color:transparent;caret-color:#e6edf3;background:transparent;position:relative;z-index:1}
+.ed-hl{position:absolute;top:0;left:0;width:100%;height:calc(100vh - 240px);margin:0;padding:14px;background:#010108;border:1px solid var(--bd);border-top:none;border-radius:0 0 12px 12px;color:#e6edf3;font-family:'Courier New',monospace;font-size:13px;line-height:1.8;white-space:pre-wrap;word-break:break-word;overflow:hidden;pointer-events:none;z-index:0;display:none;tab-size:2}
+.ed-wrap.hl-active .ed-hl{display:block}
+.tok-kw{color:#ff7b72}
+.tok-str{color:#a5d6ff}
+.tok-num{color:#79c0ff}
+.tok-com{color:#8b949e;font-style:italic}
+.tok-fn{color:#d2a8ff}
+.tok-punc{color:#e6edf3}
+.tok-prop{color:#79c0ff}
 .upzone{border:2px dashed var(--bd);border-radius:16px;padding:40px 16px;text-align:center;cursor:pointer;background:var(--s2);transition:.3s;margin-bottom:12px}
 .upzone:active,.upzone.drag{border-color:var(--ac);background:rgba(108,99,255,.05)}
 .uz-i{font-size:48px;margin-bottom:12px;animation:bounce 2s ease-in-out infinite}
@@ -1330,6 +1478,12 @@ textarea.ci:focus{border-color:var(--ac)}
 #envEd{width:100%;height:250px;background:#010108;border:1px solid var(--bd);border-radius:10px;padding:12px;color:#e6edf3;font-family:'Courier New',monospace;font-size:13px;line-height:1.8;resize:vertical;outline:none;margin-bottom:10px;transition:.2s}
 #envEd:focus{border-color:var(--ac)}
 .set-card{background:var(--s2);border:1px solid var(--bd);border-radius:14px;padding:14px;margin-bottom:10px}
+.owner-card{background:linear-gradient(135deg,#1a1530,#241a3d);border:1px solid #4a3a7a}
+.owner-crown{text-align:center;font-weight:800;font-size:13px;color:#e0c14a;text-shadow:0 0 10px rgba(224,193,74,.4);margin-bottom:12px;letter-spacing:.5px}
+.owner-row{display:flex;justify-content:space-between;padding:6px 2px;font-size:12.5px;border-bottom:1px solid rgba(255,255,255,.05)}
+.owner-k{color:var(--mu)}
+.owner-v{color:var(--tx);font-weight:600;text-align:right}
+.owner-sep{text-align:center;font-size:10px;color:#8a7ab8;margin:12px 0 8px;letter-spacing:1px;text-transform:uppercase}
 .set-title{font-size:13px;font-weight:700;color:#fff;margin-bottom:12px}
 .set-row{display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.04);gap:8px}
 .set-row:last-child{border-bottom:none;padding-bottom:0}
@@ -1365,6 +1519,7 @@ textarea.ci:focus{border-color:var(--ac)}
     <div class="top-pill" id="mongoPill"><div class="dot" id="mongoDot"></div><span id="mongoStatus">DB</span></div>
   </div>
   <button class="bell-btn" onclick="openAlerts()">🔔<span class="bell-badge" id="bellBadge" style="display:none">0</span></button>
+  <button class="bell-btn" onclick="doReset()" title="পুরনো লগ/নোটিফিকেশন মুছে ফ্রেশ করো">🔄</button>
   <button class="top-out" onclick="location.href='/logout'">বের</button>
 </div>
 
@@ -1559,17 +1714,31 @@ textarea.ci:focus{border-color:var(--ac)}
       <button class="tbtn" onclick="closeEd()">← ফিরে</button>
       <span class="ed-fn" id="edFn"></span>
       <span class="ed-lang" id="edLang"></span>
+      <button class="tbtn" onclick="testFile()">🧪 টেস্ট</button>
       <button class="tbtn p" onclick="saveFile()">💾 সেভ</button>
       <button class="tbtn" onclick="dlF(curEdit)">⬇️</button>
     </div>
-    <textarea id="ced" spellcheck="false"></textarea>
+    <div class="ed-wrap">
+      <pre id="cedHl" class="ed-hl" aria-hidden="true"><code></code></pre>
+      <textarea id="ced" spellcheck="false" oninput="onEdInput()" onscroll="syncEdScroll()"></textarea>
+    </div>
+  </div>
+  <div id="testOverlay" class="test-overlay" onclick="closeTest()"></div>
+  <div id="testPanel" class="test-panel">
+    <div class="test-head">
+      <div style="font-weight:800;font-size:15px">🧪 কমান্ড টেস্ট রিপোর্ট</div>
+      <button class="tbtn" onclick="closeTest()">✕ বন্ধ</button>
+    </div>
+    <div id="testBody" class="test-body"></div>
   </div>
   <div id="fmView">
     <div class="pathbar" id="pathBar">📁 root</div>
+    <div class="fm-summary" id="fmSummary"></div>
     <div class="fm-acts">
       <button class="tbtn p" onclick="showM('mkdir')">📁+</button>
       <button class="tbtn p" onclick="showM('newfile')">📄+</button>
       <button class="tbtn" onclick="loadFiles(curDir)">🔄</button>
+      <button class="tbtn" onclick="promptTest()">🧪 ফাইল টেস্ট</button>
       <button class="tbtn" onclick="editF('package.json')">📋 pkg</button>
       <button class="tbtn" onclick="editF('index.js')">📜 index</button>
       <button class="tbtn" onclick="editF('.env')">🔐 env</button>
@@ -1625,6 +1794,23 @@ textarea.ci:focus{border-color:var(--ac)}
 
 <!-- MORE -->
 <div id="pg-more" class="page">
+  <!-- OWNER INFO -->
+  <div class="set-card owner-card">
+    <div class="owner-crown">👑 MASTER BELAL NETWORK 👑</div>
+    <div class="owner-row"><span class="owner-k">👤 Name</span><span class="owner-v">BELAL YT (Verified)</span></div>
+    <div class="owner-row"><span class="owner-k">🎭 Nick</span><span class="owner-v">চাঁদের পাহাড়</span></div>
+    <div class="owner-row"><span class="owner-k">🚹 Gender</span><span class="owner-v">Male 💎</span></div>
+    <div class="owner-row"><span class="owner-k">❤️ Relation</span><span class="owner-v">Royal 💎</span></div>
+    <div class="owner-row"><span class="owner-k">🕌 Religion</span><span class="owner-v">Islam (🕋)</span></div>
+    <div class="owner-row"><span class="owner-k">🏫 Profession</span><span class="owner-v">Bot Developer / Business</span></div>
+    <div class="owner-row"><span class="owner-k">🏡 Address</span><span class="owner-v">Kurigram, BD 🇧🇩</span></div>
+    <div class="owner-sep">🔗 CONNECT ME 🔗</div>
+    <div class="owner-row"><span class="owner-k">📞 WhatsApp</span><span class="owner-v">01913246554</span></div>
+    <div class="owner-row"><span class="owner-k">🎬 TikTok</span><span class="owner-v">চাঁদের পাহাড়</span></div>
+    <div class="owner-sep">⚡ THIS PANEL ⚡</div>
+    <div class="owner-row"><span class="owner-k">🛡️ Status</span><span class="owner-v">Online & Active 💎</span></div>
+  </div>
+
   <!-- ENV -->
   <div class="set-card">
     <div class="set-title">⚙️ Environment (.env)</div>
@@ -1804,6 +1990,15 @@ function toggleLogFullscreen(){
   if(autoScroll) box.scrollTop=box.scrollHeight;
 }
 function clearLogs(){fetch("/api/bot/clearlogs",{method:"POST"});}
+async function doReset(){
+  if(!confirm("পুরনো সব লগ আর নোটিফিকেশন মুছে একদম ফ্রেশ শুরু করবে?")) return;
+  await fetch("/api/bot/clearlogs",{method:"POST"});
+  await fetch("/api/alerts/clear",{method:"POST"});
+  document.getElementById("lbox").innerHTML="";
+  document.getElementById("alertBanner").innerHTML="";
+  _alertsCache=[]; _unreadAlerts=0; updateBellBadge(); renderAlertList();
+  toast("🔄 রিসেট হয়ে গেছে — ফ্রেশ শুরু","success");
+}
 function clearLogFile(){if(!confirm("Log file মুছবেন?"))return;fetch("/api/bot/clearlogfile",{method:"POST"}).then(r=>r.json()).then(d=>toast(d.ok?"✅ মুছা হয়েছে":"❌ ব্যর্থ",d.ok?"success":"error"));}
 
 function updateStatus(running,starting){
@@ -2018,6 +2213,15 @@ function ficon(name,isDir){
   const e=name.split(".").pop().toLowerCase();
   return{js:"📜",mjs:"📜",cjs:"📜",json:"📋",md:"📝",txt:"📄",env:"🔐",log:"📋",jpg:"🖼",jpeg:"🖼",png:"🖼",gif:"🖼",webp:"🖼",mp3:"🎵",mp4:"🎬",zip:"📦",tar:"📦",gz:"📦",html:"🌐",css:"🎨",ts:"📘",py:"🐍",sh:"⚡",bat:"⚡",yml:"⚙️",yaml:"⚙️",xml:"📋",lock:"🔒",gitignore:"👁️",npmrc:"⚙️",babelrc:"⚙️"}[e]||"📄";
 }
+function ftype(name,isDir){
+  if(isDir)return"ft-dir";
+  const e=name.split(".").pop().toLowerCase();
+  if(["js","mjs","cjs","ts","py","sh","bat"].includes(e))return"ft-code";
+  if(["json","yml","yaml","xml","env","lock"].includes(e))return"ft-data";
+  if(["jpg","jpeg","png","gif","webp","mp3","mp4"].includes(e))return"ft-media";
+  if(["zip","tar","gz"].includes(e))return"ft-archive";
+  return"ft-doc";
+}
 function langExt(n){const e=n.split(".").pop().toLowerCase();return{js:"JavaScript",json:"JSON",md:"Markdown",html:"HTML",css:"CSS",py:"Python",ts:"TypeScript",sh:"Shell",env:"ENV",txt:"Text",yml:"YAML",xml:"XML"}[e]||e.toUpperCase();}
 
 function buildPath(dir){
@@ -2037,6 +2241,8 @@ async function loadFiles(dir){
   document.getElementById("fq").value="";
   document.getElementById("uploadDir").textContent=curDir||"root";
   const data=await fetch("/api/files?path="+encodeURIComponent(curDir)).then(r=>r.json());
+  const nFiles=(data.items||[]).filter(i=>!i.isDir).length, nDirs=(data.items||[]).filter(i=>i.isDir).length;
+  document.getElementById("fmSummary").textContent="📁 "+nDirs+" ফোল্ডার · 📄 "+nFiles+" ফাইল";
   const list=document.getElementById("flist");list.innerHTML="";
   if(curDir){
     const up=document.createElement("div");up.className="frow";
@@ -2048,10 +2254,11 @@ async function loadFiles(dir){
   data.items.forEach(item=>{
     const fp=curDir?curDir+"/"+item.name:item.name;
     const row=document.createElement("div");row.className="frow";
-    row.innerHTML='<span class="fi">'+ficon(item.name,item.isDir)+'</span>'
+    row.innerHTML='<span class="fi '+ftype(item.name,item.isDir)+'">'+ficon(item.name,item.isDir)+'</span>'
       +'<div class="fn"><div class="fn-name">'+item.name+'</div><div class="fn-meta">'+fsz(item.size)+(item.mtime?' · <span data-mtime="'+item.mtime+'">'+fdt(item.mtime)+'</span>':"")+'</div></div>'
       +'<div class="fa">'
       +(item.isDir?'':'<button class="fab" onclick="event.stopPropagation();editF(\\''+fp+'\\')">✏️</button>')
+      +(!item.isDir && /\.js$/i.test(item.name)?'<button class="fab" onclick="event.stopPropagation();quickTest(\\''+fp+'\\')">🧪</button>':'')
       +'<button class="fab" onclick="event.stopPropagation();dlF(\\''+fp+'\\')">⬇️</button>'
       +'<button class="fab" onclick="event.stopPropagation();showRename(\\''+fp+'\\',\\''+item.name+'\\')">🔤</button>'
       +'<button class="fab" onclick="event.stopPropagation();showCopy(\\''+fp+'\\')">📋</button>'
@@ -2072,8 +2279,84 @@ async function editF(p){
   document.getElementById("ced").value=d.content;
   document.getElementById("fmView").style.display="none";
   document.getElementById("edView").style.display="block";
+  const isHl = /\.(js|json|mjs|cjs)$/i.test(p);
+  document.querySelector(".ed-wrap").classList.toggle("hl-active", isHl);
+  document.getElementById("ced").classList.toggle("hl-on", isHl);
+  if(isHl) renderHighlight();
+}
+function onEdInput(){ if(document.querySelector(".ed-wrap").classList.contains("hl-active")) renderHighlight(); }
+function syncEdScroll(){
+  const hl=document.getElementById("cedHl"), ta=document.getElementById("ced");
+  hl.scrollTop=ta.scrollTop; hl.scrollLeft=ta.scrollLeft;
+}
+function renderHighlight(){
+  const code=document.getElementById("ced").value;
+  document.querySelector("#cedHl code").innerHTML=highlightJS(code);
+  syncEdScroll();
+}
+function highlightJS(src){
+  let s=esc(src);
+  // কমেন্ট আর স্ট্রিং আগে টোকেনাইজ করা হচ্ছে যাতে ওগুলোর ভিতরের কিওয়ার্ড রঙিন না হয়ে যায়
+  const tokens=[];
+  s=s.replace(/(\/\*[\s\S]*?\*\/|\/\/[^\n]*)/g,m=>{tokens.push('<span class="tok-com">'+m+'</span>');return "\u0000"+(tokens.length-1)+"\u0000";});
+  s=s.replace(/(&quot;(?:[^&]|&(?!quot;))*?&quot;|'(?:[^'\\]|\\.)*')/g,m=>{tokens.push('<span class="tok-str">'+m+'</span>');return "\u0000"+(tokens.length-1)+"\u0000";});
+  s=s.replace(/\b(const|let|var|function|async|await|return|if|else|for|while|do|switch|case|break|continue|try|catch|finally|throw|new|class|extends|super|this|typeof|instanceof|in|of|null|undefined|true|false|import|export|default|require|module|exports|delete|void|yield|static|get|set)\b/g,'<span class="tok-kw">$1</span>');
+  s=s.replace(/\b(\d+\.?\d*)\b/g,'<span class="tok-num">$1</span>');
+  s=s.replace(/\b([a-zA-Z_$][\w$]*)(?=\s*\()/g,'<span class="tok-fn">$1</span>');
+  s=s.replace(/\u0000(\d+)\u0000/g,(_,i)=>tokens[+i]);
+  return s;
 }
 function closeEd(){document.getElementById("edView").style.display="none";document.getElementById("fmView").style.display="block";}
+async function testFile(pathOverride){
+  const target = pathOverride || curEdit;
+  if(!target) return;
+  document.getElementById("testOverlay").classList.add("show");
+  document.getElementById("testPanel").classList.add("show");
+  document.getElementById("testBody").innerHTML='<div style="text-align:center;padding:30px;color:var(--mu)">⏳ টেস্ট চলছে...</div>';
+  try{
+    const d=await fetch("/api/file/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:target})}).then(r=>r.json());
+    if(!d.ok){ document.getElementById("testBody").innerHTML='<div class="test-sec bad"><div class="test-sec-title">❌ ব্যর্থ</div><div class="test-sec-msg">'+esc(d.msg||d.error||"অজানা এরর")+'</div></div>'; return; }
+    renderTestResult(d.result);
+  }catch(e){ document.getElementById("testBody").innerHTML='<div class="test-sec bad"><div class="test-sec-title">❌ নেটওয়ার্ক এরর</div></div>'; }
+}
+function quickTest(fp){ testFile(fp); }
+function promptTest(){
+  const p=prompt("কোন ফাইল টেস্ট করতে চাও? (যেমন: Script/commands/video.js)", curDir?curDir+"/":"");
+  if(p&&p.trim()) testFile(p.trim());
+}
+function closeTest(){
+  document.getElementById("testOverlay").classList.remove("show");
+  document.getElementById("testPanel").classList.remove("show");
+}
+function renderTestResult(r){
+  let html="";
+  const structOk = !r.structure || r.structure.ok;
+  const depsOk = !r.dependencies || r.dependencies.every(d=>d.ok);
+  const apisOk = !r.apis || r.apis.every(a=>a.ok);
+  const allGood = r.syntax.ok && structOk && depsOk && apisOk;
+  html += allGood
+    ? '<div class="test-sec ok" style="text-align:center;font-size:14px;font-weight:800">✅ এই ফাইল সম্পূর্ণ ঠিক আছে — নিশ্চিন্তে ব্যবহার করতে পারো</div>'
+    : '<div class="test-sec bad" style="text-align:center;font-size:14px;font-weight:800">⚠️ এই ফাইলে সমস্যা আছে — নিচে বিস্তারিত দেখো</div>';
+  html+='<div class="test-sec '+(r.syntax.ok?"ok":"bad")+'"><div class="test-sec-title">'+(r.syntax.ok?"✅":"❌")+' সিনট্যাক্স</div><div class="test-sec-msg">'+esc(r.syntax.msg)+'</div></div>';
+  if(r.structure){
+    html+='<div class="test-sec '+(r.structure.ok?"ok":"bad")+'"><div class="test-sec-title">'+(r.structure.ok?"✅":"❌")+' কমান্ড স্ট্রাকচার</div><div class="test-sec-msg">'+esc(r.structure.msg)+'</div></div>';
+  }
+  if(r.dependencies && r.dependencies.length){
+    const allOk=r.dependencies.every(d=>d.ok);
+    html+='<div class="test-sec '+(allOk?"ok":"bad")+'"><div class="test-sec-title">'+(allOk?"✅":"⚠️")+' Dependencies</div>';
+    r.dependencies.forEach(d=>{ html+='<div class="test-api-row"><span class="test-api-url">'+esc(d.pkg)+'</span><span class="test-api-status '+(d.ok?"ok":"bad")+'">'+(d.ok?"✅ আছে":"❌ নেই")+'</span></div>'; });
+    html+='</div>';
+  }
+  if(r.apis && r.apis.length){
+    const allOk=r.apis.every(a=>a.ok);
+    html+='<div class="test-sec '+(allOk?"ok":"bad")+'"><div class="test-sec-title">'+(allOk?"✅":"⚠️")+' API লিংক (লাইভ চেক)</div>';
+    r.apis.forEach(a=>{ html+='<div class="test-api-row"><span class="test-api-url">'+esc(a.url)+'</span><span class="test-api-status '+(a.ok?"ok":"bad")+'">'+esc(String(a.status))+'</span></div>'; });
+    html+='</div>';
+  } else if(r.syntax.ok){
+    html+='<div class="test-sec-msg" style="text-align:center;padding:8px">ℹ️ ফাইলে কোনো http/https লিংক পাওয়া যায়নি</div>';
+  }
+  document.getElementById("testBody").innerHTML=html;
+}
 async function saveFile(){
   const d=await fetch("/api/file/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:curEdit,content:document.getElementById("ced").value})}).then(r=>r.json());
   toast(d.ok?"✅ সেভ + MongoDB আপডেট":"❌ "+d.error,d.ok?"success":"error");

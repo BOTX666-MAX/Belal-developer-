@@ -2112,10 +2112,10 @@ async function refresh(){
     _refreshFails=0;
   }catch(e){
     _refreshFails++;
-    if(_refreshFails>=2){
-      const st=document.getElementById("sTxt"); if(st) st.textContent="⚠️ সার্ভার সাড়া দিচ্ছে না";
-      const ts=document.getElementById("tStatus"); if(ts) ts.textContent="⚠️ সাড়া নেই";
-    }
+    const st=document.getElementById("sTxt"); if(st) st.textContent="⚠️ এরর: "+(e&&e.message?e.message:String(e)).slice(0,60);
+    const ts=document.getElementById("tStatus"); if(ts) ts.textContent="⚠️ এরর দেখো নিচে";
+    console.error("[refresh error]", e);
+    showGlobalError("refresh() failed: "+((e&&e.stack)?e.stack:String(e)));
   }
 }
 let _refreshFails=0;
@@ -2609,6 +2609,20 @@ document.addEventListener("keydown",e=>{
   if((e.ctrlKey||e.metaKey)&&e.key==="s"&&curEdit){e.preventDefault();saveFile();}
   if(e.key==="Escape") document.querySelectorAll(".mbg.open").forEach(m=>m.classList.remove("open"));
 });
+
+// ── গ্লোবাল এরর ক্যাচার — যেকোনো জায়গায় JS এরর হলে সাথে সাথে স্ক্রিনে দেখাবে ──
+function showGlobalError(msg){
+  let diag=document.getElementById("diagBox");
+  if(!diag){
+    diag=document.createElement("div");
+    diag.id="diagBox";
+    diag.style.cssText="position:fixed;bottom:70px;left:8px;right:8px;background:#2a0a0a;border:2px solid #ff4444;border-radius:10px;padding:12px;z-index:999;font-family:monospace;font-size:11px;color:#ffaaaa;max-height:200px;overflow-y:auto";
+    document.body.appendChild(diag);
+  }
+  diag.innerHTML="🔴 GLOBAL ERROR ("+new Date().toLocaleTimeString()+")<br>"+esc(msg).replace(/\n/g,"<br>")+"<hr>"+diag.innerHTML;
+}
+window.addEventListener("error", (e)=>{ showGlobalError((e.message||"unknown")+" @ "+(e.filename||"")+":"+(e.lineno||"")); });
+window.addEventListener("unhandledrejection", (e)=>{ showGlobalError("Unhandled Promise: "+(e.reason&&e.reason.message?e.reason.message:String(e.reason))); });
 
 // INIT
 connectWS();

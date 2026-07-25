@@ -532,12 +532,12 @@ app.get("/login",(req,res)=>{if(req.session.ok||getCookies(req).authToken===cfg.
 app.post("/login",(req,res)=>{
   if(req.body.password===PASS){
     req.session.ok=true;
-    res.setHeader("Set-Cookie", `authToken=${cfg.authToken}; Max-Age=${30*24*60*60}; Path=/; HttpOnly; SameSite=Lax`);
+    res.append("Set-Cookie", `authToken=${cfg.authToken}; Max-Age=${30*24*60*60}; Path=/; HttpOnly; SameSite=Lax`);
     res.json({ok:true});
   }
   else res.json({ok:false,msg:"❌ ভুল পাসওয়ার্ড"});
 });
-app.get("/logout",(req,res)=>{req.session.destroy(()=>{}); res.setHeader("Set-Cookie","authToken=; Max-Age=0; Path=/"); res.redirect("/login");});
+app.get("/logout",(req,res)=>{req.session.destroy(()=>{}); res.append("Set-Cookie","authToken=; Max-Age=0; Path=/"); res.redirect("/login");});
 app.get("/"   ,auth,(req,res)=>res.send(mainHTML()));
 
 // ── BOT API ──

@@ -554,24 +554,24 @@ app.post("/api/bot/autorestart",auth,(req,res)=>{autoRestart=true;cfg.autoRestar
 app.get("/api/bot/downloadlog",auth,(req,res)=>{if(fs.existsSync(LFILE))res.download(LFILE,"bot.log");else res.status(404).send("No log");});
 app.post("/api/bot/clearlogfile",auth,(req,res)=>{try{fs.writeFileSync(LFILE,"");res.json({ok:true});}catch(e){res.json({ok:false,msg:e.message});}});
 
-app.get("/api/stats",auth,(req,res)=>{
-  let _fileCountCache = {value:0, at:0};
-  function countF(d){
-    if(Date.now()-_fileCountCache.at < 60000) return _fileCountCache.value; // ৬০ সেকেন্ড ক্যাশ — বারবার ভারী ডিস্ক-স্ক্যান এড়ানো
-    function walk(dir){
-      let c=0;
-      try{
-        fs.readdirSync(dir).forEach(f=>{
-          if(f==="node_modules"||f===".git") return; // এগুলো বট ফাইল না, গুনে লাভ নেই — শুধু সময় নষ্ট
-          const s=fs.statSync(path.join(dir,f));
-          c+=s.isDirectory()?walk(path.join(dir,f)):1;
-        });
-      }catch{}
-      return c;
-    }
-    _fileCountCache = {value: walk(d), at: Date.now()};
-    return _fileCountCache.value;
+let _fileCountCache = {value:0, at:0};
+function countF(d){
+  if(Date.now()-_fileCountCache.at < 60000) return _fileCountCache.value; // ৬০ সেকেন্ড ক্যাশ — বারবার ভারী ডিস্ক-স্ক্যান এড়ানো
+  function walk(dir){
+    let c=0;
+    try{
+      fs.readdirSync(dir).forEach(f=>{
+        if(f==="node_modules"||f===".git") return; // এগুলো বট ফাইল না, গুনে লাভ নেই — শুধু সময় নষ্ট
+        const s=fs.statSync(path.join(dir,f));
+        c+=s.isDirectory()?walk(path.join(dir,f)):1;
+      });
+    }catch{}
+    return c;
   }
+  _fileCountCache = {value: walk(d), at: Date.now()};
+  return _fileCountCache.value;
+}
+app.get("/api/stats",auth,(req,res)=>{
   res.json({...stats,running:!!botProc,ready:botReady,currentUptime:botStart?Math.floor((Date.now()-botStart)/1000):0,
     autoRestart,memMB:Math.round(process.memoryUsage().rss/1024/1024),
     serverUptime:Math.floor(process.uptime()),node:process.version,
@@ -2057,7 +2057,13 @@ setInterval(()=>{if(!_botRunning)return;_botUpSec++;const el=document.getElement
 
 async function refresh(){
   try{
-    const[st,bs]=await Promise.all([fetch("/api/stats").then(r=>r.json()),fetch("/api/bot/status").then(r=>r.json())]);
+    const ac=new AbortController();
+    const toId=setTimeout(()=>ac.abort(),8000); // ৮ সেকেন্ডে সাড়া না পেলে থেমে যাওয়ার বদলে টাইমআউট ধরে নেওয়া হবে
+    const[st,bs]=await Promise.all([
+      fetch("/api/stats",{signal:ac.signal}).then(r=>r.json()),
+      fetch("/api/bot/status",{signal:ac.signal}).then(r=>r.json())
+    ]);
+    clearTimeout(toId);
     document.getElementById("cMem").textContent=st.memMB||"--";
     document.getElementById("cSup").textContent=fmtT(st.serverUptime||0);
     document.getElementById("cFiles").textContent=st.botFiles||0;
@@ -2079,8 +2085,16 @@ async function refresh(){
     if(hl)hl.innerHTML=hist.length?hist.map(h=>'<div class="hi"><span class="hi-date">'+new Date(h.date).toLocaleString("bn-BD").substring(0,16)+'</span><span class="hi-up">'+fmtT(h.uptime)+'</span><span class="hi-code">'+h.code+'</span></div>').join(""):'<div style="font-size:12px;color:var(--mu);text-align:center;padding:10px">ইতিহাস নেই</div>';
     const pgMon=document.getElementById("pg-monitor");
     if(pgMon&&pgMon.classList.contains("active")) loadMonitor();
-  }catch{}
+    _refreshFails=0;
+  }catch(e){
+    _refreshFails++;
+    if(_refreshFails>=2){
+      const st=document.getElementById("sTxt"); if(st) st.textContent="⚠️ সার্ভার সাড়া দিচ্ছে না";
+      const ts=document.getElementById("tStatus"); if(ts) ts.textContent="⚠️ সাড়া নেই";
+    }
+  }
 }
+let _refreshFails=0;
 
 // LIVE MONITOR
 function _mColor(pct){ return pct<60?"var(--gr)":pct<85?"var(--yw)":"var(--rd)"; }

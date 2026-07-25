@@ -39,6 +39,12 @@ function loadJ(f,def={}){try{return JSON.parse(fs.readFileSync(f,"utf8"));}catch
 function saveJ(f,d){try{fs.writeFileSync(f,JSON.stringify(d,null,2));}catch{}}
 
 let cfg   = loadJ(CFG);
+if(!cfg.authToken){ cfg.authToken = require("crypto").randomBytes(24).toString("hex"); saveJ(CFG,cfg); }
+function getCookies(req){
+  const out={}; const h=req.headers.cookie;
+  if(h) h.split(";").forEach(p=>{ const i=p.indexOf("="); if(i>0) out[p.slice(0,i).trim()]=decodeURIComponent(p.slice(i+1).trim()); });
+  return out;
+}
 let stats = loadJ(SFILE,{starts:0,crashes:0,totalUptime:0,history:[],loginAttempts:{}});
 let lifetime = loadJ(LTFILE,{peakPanelMB:0,peakBotMB:0,peakMongoMB:0,firstSeen:new Date().toISOString()});
 const PASS = process.env.PANEL_PASSWORD || cfg.password || "admin123";
@@ -278,7 +284,13 @@ app.use(express.urlencoded({extended:true,limit:"500mb"}));
 app.use(session({secret:process.env.SESSION_SECRET||"belal_bot_panel_2024",resave:false,saveUninitialized:false,cookie:{maxAge:7*24*60*60*1000}}));
 const upload = multer({storage:multer.diskStorage({destination:(r,f,cb)=>cb(null,"/tmp/"),filename:(r,f,cb)=>cb(null,Date.now()+"_"+f.originalname)}),limits:{fileSize:500*1024*1024}});
 
-const auth = (req,res,next) => req.session.ok ? next() : res.redirect("/login");
+const auth = (req,res,next) => {
+  const okSession = req.session && req.session.ok;
+  const okToken = getCookies(req).authToken === cfg.authToken;
+  if(okSession || okToken) return next();
+  if(req.path.startsWith("/api/")) return res.status(401).json({error:"session expired — আবার লগইন করো"});
+  res.redirect("/login");
+};
 const safe = (base,rel) => { const f=path.resolve(base,rel||""); if(!f.startsWith(path.resolve(base))) throw new Error("Access denied"); return f; };
 
 // ── BOT ──
@@ -516,12 +528,16 @@ setInterval(async()=>{
 // ── ROUTES: AUTH ──
 app.get("/ping",(req,res)=>res.json({ok:true,running:!!botProc,mongo:db_connected,time:new Date().toISOString()}));
 app.get("/health",(req,res)=>res.json({ok:true}));
-app.get("/login",(req,res)=>{if(req.session.ok)return res.redirect("/");res.send(loginHTML());});
+app.get("/login",(req,res)=>{if(req.session.ok||getCookies(req).authToken===cfg.authToken)return res.redirect("/");res.send(loginHTML());});
 app.post("/login",(req,res)=>{
-  if(req.body.password===PASS){req.session.ok=true;res.json({ok:true});}
+  if(req.body.password===PASS){
+    req.session.ok=true;
+    res.setHeader("Set-Cookie", `authToken=${cfg.authToken}; Max-Age=${30*24*60*60}; Path=/; HttpOnly; SameSite=Lax`);
+    res.json({ok:true});
+  }
   else res.json({ok:false,msg:"❌ ভুল পাসওয়ার্ড"});
 });
-app.get("/logout",(req,res)=>{req.session.destroy();res.redirect("/login");});
+app.get("/logout",(req,res)=>{req.session.destroy(()=>{}); res.setHeader("Set-Cookie","authToken=; Max-Age=0; Path=/"); res.redirect("/login");});
 app.get("/"   ,auth,(req,res)=>res.send(mainHTML()));
 
 // ── BOT API ──
@@ -2059,11 +2075,13 @@ async function refresh(){
   try{
     const ac=new AbortController();
     const toId=setTimeout(()=>ac.abort(),8000); // ৮ সেকেন্ডে সাড়া না পেলে থেমে যাওয়ার বদলে টাইমআউট ধরে নেওয়া হবে
-    const[st,bs]=await Promise.all([
-      fetch("/api/stats",{signal:ac.signal}).then(r=>r.json()),
-      fetch("/api/bot/status",{signal:ac.signal}).then(r=>r.json())
+    const [rSt, rBs] = await Promise.all([
+      fetch("/api/stats",{signal:ac.signal}),
+      fetch("/api/bot/status",{signal:ac.signal})
     ]);
     clearTimeout(toId);
+    if(rSt.status===401 || rBs.status===401){ location.href="/login"; return; }
+    const st = await rSt.json(), bs = await rBs.json();
     document.getElementById("cMem").textContent=st.memMB||"--";
     document.getElementById("cSup").textContent=fmtT(st.serverUptime||0);
     document.getElementById("cFiles").textContent=st.botFiles||0;

@@ -528,7 +528,11 @@ setInterval(async()=>{
 // ── ROUTES: AUTH ──
 app.get("/ping",(req,res)=>res.json({ok:true,running:!!botProc,mongo:db_connected,time:new Date().toISOString()}));
 app.get("/health",(req,res)=>res.json({ok:true}));
-app.get("/login",(req,res)=>{if(req.session.ok||getCookies(req).authToken===cfg.authToken)return res.redirect("/");res.send(loginHTML());});
+app.get("/login",(req,res)=>{
+  res.set("Cache-Control","no-store, no-cache, must-revalidate, proxy-revalidate");res.set("Pragma","no-cache");res.set("Expires","0");
+  if(req.session.ok||getCookies(req).authToken===cfg.authToken)return res.redirect("/");
+  res.send(loginHTML());
+});
 app.post("/login",(req,res)=>{
   if(req.body.password===PASS){
     req.session.ok=true;
@@ -538,7 +542,7 @@ app.post("/login",(req,res)=>{
   else res.json({ok:false,msg:"❌ ভুল পাসওয়ার্ড"});
 });
 app.get("/logout",(req,res)=>{req.session.destroy(()=>{}); res.append("Set-Cookie","authToken=; Max-Age=0; Path=/"); res.redirect("/login");});
-app.get("/"   ,auth,(req,res)=>res.send(mainHTML()));
+app.get("/"   ,auth,(req,res)=>{res.set("Cache-Control","no-store, no-cache, must-revalidate, proxy-revalidate");res.set("Pragma","no-cache");res.set("Expires","0");res.send(mainHTML());});
 
 // ── BOT API ──
 app.post("/api/bot/start",   auth,(req,res)=>res.json(startBot()));
@@ -1247,6 +1251,7 @@ document.getElementById("pw").addEventListener("keydown",e=>e.key==="Enter"&&log
 
 function mainHTML(){
 const pname=cfg.panelName||"Bot Panel";
+const BUILD_VER="2026-07-25-v1"; // ── প্রতিবার নতুন কোড দেওয়ার সময় এই নম্বর বদলে দেওয়া হয় — "আরো" ট্যাবে দেখা যাবে, cache বাসি কিনা যাচাই করতে সাহায্য করবে
 return `<!DOCTYPE html><html lang="bn"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="mobile-web-app-capable" content="yes">
@@ -1825,6 +1830,7 @@ textarea.ci:focus{border-color:var(--ac)}
     <div class="owner-row"><span class="owner-k">🎬 TikTok</span><span class="owner-v">চাঁদের পাহাড়</span></div>
     <div class="owner-sep">⚡ THIS PANEL ⚡</div>
     <div class="owner-row"><span class="owner-k">🛡️ Status</span><span class="owner-v">Online & Active 💎</span></div>
+    <div class="owner-row"><span class="owner-k">🏗️ Panel Build</span><span class="owner-v" style="font-family:monospace;font-size:10px">${BUILD_VER}</span></div>
   </div>
 
   <!-- ENV -->

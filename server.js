@@ -1909,6 +1909,24 @@ textarea.ci:focus{border-color:var(--ac)}
 <div class="tw" id="tw"></div>
 
 <script>
+// ── গ্লোবাল এরর ক্যাচার — script-এর একদম শুরুতে, যাতে যেকোনো পরবর্তী কোডে এরর হলেও সাথে সাথে স্ক্রিনে দেখা যায় ──
+// (কোনো bare dependency নেই অন্য ফাংশনের উপর, যাতে সবার আগে এবং সবসময় নির্ভরযোগ্যভাবে কাজ করে)
+function _escSafe(t){return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function showGlobalError(msg){
+  try{
+    let diag=document.getElementById("diagBox");
+    if(!diag){
+      diag=document.createElement("div");
+      diag.id="diagBox";
+      diag.style.cssText="position:fixed;bottom:70px;left:8px;right:8px;background:#2a0a0a;border:2px solid #ff4444;border-radius:10px;padding:12px;z-index:9999;font-family:monospace;font-size:11px;color:#ffaaaa;max-height:200px;overflow-y:auto;pointer-events:auto";
+      (document.body||document.documentElement).appendChild(diag);
+    }
+    diag.innerHTML="🔴 GLOBAL ERROR ("+new Date().toLocaleTimeString()+")<br>"+_escSafe(msg).replace(/\n/g,"<br>")+"<hr>"+diag.innerHTML;
+  }catch(e){ /* ডায়াগনস্টিক নিজেই যেন কখনো ক্র্যাশ না করে */ }
+}
+window.addEventListener("error", function(e){ showGlobalError((e.message||"unknown")+" @ "+(e.filename||"")+":"+(e.lineno||"")); });
+window.addEventListener("unhandledrejection", function(e){ showGlobalError("Unhandled Promise: "+(e.reason&&e.reason.message?e.reason.message:String(e.reason))); });
+
 let curDir="",curEdit="",renameFrom="",copyFrom="",logFilter="all",autoScroll=true;
 let ws,_botUpSec=0,_botRunning=false;
 
@@ -2129,15 +2147,15 @@ async function loadTerminal(){
     const now=new Date();
     document.getElementById("hkTime").textContent=now.toLocaleTimeString("en-GB");
     if(d.net){
-      document.getElementById("hkRx").textContent=(d.net.rxKBs??0).toFixed(1);
-      document.getElementById("hkTx").textContent=(d.net.txKBs??0).toFixed(1);
+      document.getElementById("hkRx").textContent=(d.net.rxKBs||0).toFixed(1);
+      document.getElementById("hkTx").textContent=(d.net.txKBs||0).toFixed(1);
       const netPct=Math.min(100,Math.round(((d.net.rxKBs||0)+(d.net.txKBs||0))/2)); // মোটামুটি ভিজ্যুয়াল স্কেল, ২০০KB/s ধরে
       document.getElementById("hkNetBar").style.width=netPct+"%";
     }
-    document.getElementById("hkCpu").textContent=d.cpuPercent??0;
-    document.getElementById("hkCpuBar").style.width=(d.cpuPercent??0)+"%";
-    document.getElementById("hkRam").textContent=d.ramPercent??0;
-    document.getElementById("hkRamBar").style.width=(d.ramPercent??0)+"%";
+    document.getElementById("hkCpu").textContent=d.cpuPercent||0;
+    document.getElementById("hkCpuBar").style.width=(d.cpuPercent||0)+"%";
+    document.getElementById("hkRam").textContent=d.ramPercent||0;
+    document.getElementById("hkRamBar").style.width=(d.ramPercent||0)+"%";
     const hv=document.getElementById("hkHeavy");
     if(hv) hv.textContent=d.heavy?(d.heavy.active+"/"+d.heavy.max):"0/2";
     if(d.uptimeSec!=null){ document.getElementById("hkUptime").textContent=fmtT(d.uptimeSec); }
@@ -2288,7 +2306,7 @@ async function loadFiles(dir){
     up.onclick=()=>loadFiles(curDir.split("/").slice(0,-1).join("/"));
     list.appendChild(up);
   }
-  if(!data.items?.length){list.innerHTML='<div class="empty-fm"><div style="font-size:40px;margin-bottom:8px">📭</div><div>ফোল্ডার খালি</div></div>';return;}
+  if(!(data.items && data.items.length)){list.innerHTML='<div class="empty-fm"><div style="font-size:40px;margin-bottom:8px">📭</div><div>ফোল্ডার খালি</div></div>';return;}
   data.items.forEach(item=>{
     const fp=curDir?curDir+"/"+item.name:item.name;
     const row=document.createElement("div");row.className="frow";
@@ -2408,7 +2426,7 @@ async function delItem(p,name){
 
 // MODALS
 document.querySelectorAll(".mbg").forEach(bg=>bg.addEventListener("click",e=>{if(e.target===bg)bg.classList.remove("open");}));
-function showM(id){document.getElementById("mod-"+id).classList.add("open");setTimeout(()=>document.querySelector("#mod-"+id+" input")?.focus(),100);}
+function showM(id){document.getElementById("mod-"+id).classList.add("open");setTimeout(()=>{var _f=document.querySelector("#mod-"+id+" input");if(_f)_f.focus();},100);}
 function closeM(id){document.getElementById("mod-"+id).classList.remove("open");}
 
 async function doMkdir(){
@@ -2449,7 +2467,7 @@ function doFS(){
   if(!q){res.style.display="none";return;}
   clearTimeout(fst);fst=setTimeout(async()=>{
     const d=await fetch("/api/file/search?q="+encodeURIComponent(q)).then(r=>r.json());
-    if(!d.results?.length){res.style.display="block";res.innerHTML='<div style="font-size:12px;color:var(--mu);padding:10px;text-align:center">📭 পাওয়া যায়নি</div>';return;}
+    if(!(d.results && d.results.length)){res.style.display="block";res.innerHTML='<div style="font-size:12px;color:var(--mu);padding:10px;text-align:center">📭 পাওয়া যায়নি</div>';return;}
     res.style.display="block";
     res.innerHTML=d.results.map(r=>'<div class="srow" onclick="'+(r.isDir?"loadFiles('"+r.path+"')":"editF('"+r.path+"')")+'"><div class="srow-p">'+ficon(r.name,r.isDir)+" "+r.path+'</div><div class="srow-m">'+fsz(r.size)+'</div></div>').join("");
   },300);
@@ -2609,20 +2627,6 @@ document.addEventListener("keydown",e=>{
   if((e.ctrlKey||e.metaKey)&&e.key==="s"&&curEdit){e.preventDefault();saveFile();}
   if(e.key==="Escape") document.querySelectorAll(".mbg.open").forEach(m=>m.classList.remove("open"));
 });
-
-// ── গ্লোবাল এরর ক্যাচার — যেকোনো জায়গায় JS এরর হলে সাথে সাথে স্ক্রিনে দেখাবে ──
-function showGlobalError(msg){
-  let diag=document.getElementById("diagBox");
-  if(!diag){
-    diag=document.createElement("div");
-    diag.id="diagBox";
-    diag.style.cssText="position:fixed;bottom:70px;left:8px;right:8px;background:#2a0a0a;border:2px solid #ff4444;border-radius:10px;padding:12px;z-index:999;font-family:monospace;font-size:11px;color:#ffaaaa;max-height:200px;overflow-y:auto";
-    document.body.appendChild(diag);
-  }
-  diag.innerHTML="🔴 GLOBAL ERROR ("+new Date().toLocaleTimeString()+")<br>"+esc(msg).replace(/\n/g,"<br>")+"<hr>"+diag.innerHTML;
-}
-window.addEventListener("error", (e)=>{ showGlobalError((e.message||"unknown")+" @ "+(e.filename||"")+":"+(e.lineno||"")); });
-window.addEventListener("unhandledrejection", (e)=>{ showGlobalError("Unhandled Promise: "+(e.reason&&e.reason.message?e.reason.message:String(e.reason))); });
 
 // INIT
 connectWS();
